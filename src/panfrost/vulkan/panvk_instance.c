@@ -10,6 +10,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <sys/stat.h>
+
 #include "util/build_id.h"
 #include "panvk_drirc.h"
 #include "util/mesa-blake3.h"
@@ -131,6 +133,47 @@ static const struct vk_instance_extension_table panvk_instance_extensions = {
    .EXT_headless_surface = true,
 #endif
 };
+
+static VkResult
+panvk_enumerate_kbase(struct vk_instance *vk_instance)
+{
+   struct panvk_instance *instance =
+      container_of(vk_instance, struct panvk_instance, vk);
+   struct stat st;
+
+   /* Returning INCOMPATIBLE_DRIVER makes the runtime fall through to normal DRM enumeration, so
+    * a system that does have a render node is completely unaffected by this path. */
+   if (PANVK_DEBUG(STARTUP))
+      mesa_logi("kbase: looking for %s", PANVK_KBASE_PATH);
+
+   if (stat(PANVK_KBASE_PATH, &st)) {
+      if (PANVK_DEBUG(STARTUP))
+         mesa_logi("kbase: %s not present, falling back to DRM enumeration",
+                   PANVK_KBASE_PATH);
+      return VK_ERROR_INCOMPATIBLE_DRIVER;
+   }
+
+   struct panvk_physical_device *device =
+      vk_zalloc(&instance->vk.alloc, sizeof(*device), 8,
+                VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   if (!device)
+      return panvk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   /* NULL drm_device selects the kbase path inside physical_device_init. */
+   VkResult result = panvk_physical_device_init(device, instance, NULL);
+   if (result != VK_SUCCESS) {
+      if (PANVK_DEBUG(STARTUP))
+         mesa_logi("kbase: physical_device_init failed (VkResult %d)", result);
+      vk_free(&instance->vk.alloc, device);
+      return result;
+   }
+
+   if (PANVK_DEBUG(STARTUP))
+      mesa_logi("kbase: physical device created");
+
+   list_addtail(&device->vk.link, &instance->vk.physical_devices.list);
+   return VK_SUCCESS;
+}
 
 static VkResult
 panvk_physical_device_try_create(struct vk_instance *vk_instance,
@@ -255,9 +298,13 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       .priv = &instance->vk.alloc,
    };
 
+   instance->vk.physical_devices.enumerate = panvk_enumerate_kbase;
    instance->vk.physical_devices.try_create_for_drm =
       panvk_physical_device_try_create;
    instance->vk.physical_devices.destroy = panvk_destroy_physical_device;
+
+   /* vk_errorf only logs in debug builds; startup debugging wants the reason a device failed. */
+   instance->vk.enable_debug_logging = PANVK_DEBUG(STARTUP);
 
    if (PANVK_DEBUG(STARTUP))
       mesa_logi("Created an instance");

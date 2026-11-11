@@ -16,6 +16,7 @@
 #include "pan_earlyzs.h"
 
 #include "panvk_cmd_push_constant.h"
+#include "panvk_gs.h"
 #include "panvk_descriptor_set.h"
 #include "panvk_macros.h"
 #include "panvk_mempool.h"
@@ -159,8 +160,22 @@ struct panvk_graphics_sysvals {
       uint32_t noperspective_varyings;
    } vs;
 
+#if PAN_ARCH >= 9
+   /* Geometry shader emulation on v9+: where the vertex shader run as compute writes its records,
+    * and where the rasterization pass reads the geometry shader's output vertices from. */
+   struct {
+      aligned_u64 pos;
+      aligned_u64 general;
+      uint32_t instance_stride;
+      uint32_t pad;
+   } gs_io;
+#endif
+
    struct {
       aligned_u64 blend_descs[MAX_RTS];
+      /* PANVK_GS_MAX_VIEWPORTS x {min x, min y, max x, max y} in pixels, max exclusive: the
+       * scissor of each viewport a geometry shader can name. 0 when none does. */
+      aligned_u64 viewport_rects;
    } fs;
 
    struct panvk_input_attachment_info iam[INPUT_ATTACHMENT_MAP_SIZE];
@@ -212,7 +227,15 @@ struct panvk_compute_sysvals {
       aligned_u64 sets[PANVK_DESC_TABLE_COMPUTE_COUNT];
    } desc;
 #endif
+
+   /* Geometry shader emulation: a lowered geometry shader runs as compute and reads its buffer
+    * addresses from here. Layout must match struct panvk_gs_push, which is what
+    * panvk_nir_lower_gs.c addresses with offsetof(). */
+   struct panvk_gs_push gs;
 } __attribute__((aligned(FAU_WORD_SIZE)));
+
+static_assert((offsetof(struct panvk_compute_sysvals, gs) % FAU_WORD_SIZE) == 0,
+              "panvk_compute_sysvals::gs must be 8-byte aligned");
 
 static_assert(offsetof(struct panvk_compute_sysvals, common) ==
                  offsetof(struct panvk_common_sysvals, common),
@@ -381,6 +404,15 @@ struct panvk_shader_desc_info {
       uint32_t count;
    } dyn_bufs;
    uint32_t fs_varying_attr_desc_count;
+
+   /* VK_EXT_descriptor_heap: the shader reads the bound heaps through the
+    * PANVK_HEAP_*_TABLE resource table entries. Embedded samplers are packed
+    * at compile time and get their own table. */
+   bool uses_heaps;
+   struct {
+      struct panvk_priv_mem descs;
+      uint32_t count;
+   } embedded_samplers;
 #endif
 };
 
@@ -400,6 +432,65 @@ struct panvk_shader_variant {
          bool tile_image_s_read;
       } fs;
    };
+
+   /* Geometry shaders are compiled as compute (see panvk_nir_lower_gs.c), so this sits outside
+    * the stage union: the variant needs cs.local_size as well. The draw path reads it to size the
+    * output buffers and the dispatch. */
+   struct {
+      uint32_t input_verts_per_prim;
+      uint32_t output_verts_per_prim;
+      uint32_t max_output_verts;
+      uint32_t max_output_prims;
+      uint32_t invocations;
+      uint64_t outputs_written;
+      enum mesa_prim output_prim;
+      /* Transform feedback, see panvk_gs_xfb_table(): the staging record size in dwords (0 =
+       * captures nothing), each xfb buffer's stride in bytes (0 = not captured to), and where
+       * every record dword goes. */
+      uint32_t xfb_dwords;
+      uint32_t xfb_strides[4];
+      uint32_t xfb_table[PANVK_XFB_MAX_RECORD_DWORDS];
+      /* geometryStreams: the streams the shader emits on, and the stream each xfb buffer
+       * captures. */
+      uint8_t stream_mask;
+      uint8_t xfb_buffer_stream[4];
+      /* Vertex shader variants: compiled to feed the emulation, so gl_Position is clip space
+       * (pan_compile_inputs::vs_keep_clip_space) and must be stored unsnapped. */
+      bool vs_clip_space;
+      /* Vertex shader variants: how many clip and cull distances it writes, in that order in
+       * VARYING_SLOT_CLIP_DIST0/1 (see panvk_nir_lower_cull_vs). The fragment shader linked
+       * against it tests exactly these. */
+      uint8_t vs_clip_count;
+      uint8_t vs_cull_count;
+      /* Vertex shaders with transform feedback outputs: their nir_xfb_info, from which the
+       * internal pass-through geometry shader that captures them is built when no geometry or
+       * tess stage follows (panvk_per_arch(xfb_passthrough_gs)). 0 = none. */
+      uint32_t vs_xfb_size;
+      uint64_t vs_xfb_info[PANVK_VS_XFB_INFO_QWORDS];
+      /* Geometry shaders: writes gl_ViewportIndex (see panvk_nir_lower_viewport_scissor_fs). */
+      bool writes_viewport;
+      /* Tess control and tess eval shaders: the execution modes, which either stage may carry
+       * (enum tess_primitive_mode, enum gl_tess_spacing). The draw merges the two. */
+      uint8_t tess_prim;
+      uint8_t tess_spacing;
+      bool tess_ccw;
+      bool tess_point_mode;
+      /* Tess control shaders: the output patch and the layout of their output record (src/poly,
+       * struct poly_tess_params). */
+      uint32_t tcs_vertices_out;
+      uint32_t tcs_nr_patch_outputs;
+      uint32_t tcs_output_stride;
+      uint64_t tcs_per_vertex_outputs;
+#if PAN_ARCH >= 9
+      /* v9: the record layout between the emulation stages, one 16-byte slot per generic
+       * location. On a vertex shader compiled for a geometry shader: what it writes per vertex
+       * (vs_for_gs). On a geometry shader: its output vertices, which the rasterization
+       * variant reads. PANVK_GS_SLOT_UNUSED for a location that is not there. */
+      bool vs_for_gs;
+      uint32_t rec_offsets[64];
+      uint32_t rec_stride;
+#endif
+   } gs;
 
    struct panvk_shader_fau_info fau;
 
@@ -441,6 +532,15 @@ enum panvk_vs_variant {
    /* Hardware vertex shader, when next stage is fragment */
    PANVK_VS_VARIANT_HW,
 
+#if PAN_ARCH >= 9
+   /* v9+ polygon modes (panvk_per_arch(polygon_mode_gs)): the vertex shader compiled for the
+    * geometry shader emulation, and the vertex shader that rasterizes the emulation's output
+    * vertices with the HW variant's varying layout, so the fragment shader linked against that
+    * reads them unchanged. Absent (bin_size 0) unless the pipeline can draw in a polygon mode. */
+   PANVK_VS_VARIANT_POLY_REC,
+   PANVK_VS_VARIANT_POLY_RAST,
+#endif
+
    PANVK_VS_VARIANTS,
 };
 
@@ -458,11 +558,22 @@ panvk_shader_num_variants(mesa_shader_stage stage)
    if (stage == MESA_SHADER_VERTEX)
       return PANVK_VS_VARIANTS;
 
+#if PAN_ARCH >= 9
+   /* v9: the lowered geometry (or tess eval) shader, compute, and the vertex shader that
+    * rasterizes its output (panvk_shader_gs_rast_variant). */
+   if (stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_TESS_EVAL)
+      return 2;
+#endif
+
    return 1;
 }
 
 static const char *panvk_vs_shader_variant_name[] = {
    [PANVK_VS_VARIANT_HW] = NULL,
+#if PAN_ARCH >= 9
+   [PANVK_VS_VARIANT_POLY_REC] = "polygon-mode emulation",
+   [PANVK_VS_VARIANT_POLY_RAST] = "polygon-mode rasterization",
+#endif
 };
 
 static const char *
@@ -477,8 +588,6 @@ panvk_shader_variant_name(const struct panvk_shader *shader,
       return panvk_vs_shader_variant_name[i];
    }
 
-   assert(panvk_shader_num_variants(shader->vk.stage) == 1);
-
    return NULL;
 }
 
@@ -488,9 +597,18 @@ panvk_shader_only_variant(const struct panvk_shader *shader)
    if (!shader)
       return NULL;
 
-   assert(panvk_shader_num_variants(shader->vk.stage) == 1);
+   assert(panvk_shader_num_variants(shader->vk.stage) == 1 ||
+          shader->vk.stage == MESA_SHADER_GEOMETRY || shader->vk.stage == MESA_SHADER_TESS_EVAL);
    return &shader->variants[0];
 }
+
+#if PAN_ARCH >= 9
+static inline const struct panvk_shader_variant *
+panvk_shader_gs_rast_variant(const struct panvk_shader *shader)
+{
+   return shader ? &shader->variants[1] : NULL;
+}
+#endif
 
 static const struct panvk_shader_variant *
 panvk_shader_hw_variant(const struct panvk_shader *shader)
@@ -519,16 +637,31 @@ panvk_shader_variant_get_dev_addr(const struct panvk_shader_variant *shader)
                    panvk_shader_num_variants((__shader)->vk.stage);            \
         ++__var)
 
+
 #if PAN_ARCH < 9
 struct panvk_shader_link {
    struct {
       struct panvk_priv_mem attribs;
    } vs, fs;
    unsigned buf_strides[PANVK_VARY_BUF_MAX];
+
+   /* Byte offset of each varying slot inside the generic buffer, PANVK_GS_SLOT_UNUSED for a slot
+    * nothing downstream reads. link_shaders() works these out anyway; the geometry shader
+    * emulation needs them at draw time to build the slot -> offset table its lowered shader
+    * reads, since a geometry shader is compiled before it is linked. */
+   uint32_t buf_offsets[VARYING_SLOT_MAX];
+
+   /* With a geometry shader: buf_offsets is the vertex shader's side (every generic slot it
+    * writes, since the geometry shader may read any of them), and the fragment shader reads the
+    * emulation's own generic buffer, laid out here: one 16-byte slot per location the geometry
+    * shader writes and the fragment shader reads. */
+   uint32_t gs_out_offsets[VARYING_SLOT_MAX];
+   uint32_t gs_out_stride;
 };
 
 VkResult panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
                                       const struct panvk_shader_variant *vs,
+                                      const struct panvk_shader_variant *gs,
                                       const struct panvk_shader_variant *fs,
                                       struct panvk_shader_link *link);
 
@@ -585,5 +718,11 @@ VkResult panvk_per_arch(create_shader_from_binary)(
 
 VkResult panvk_per_arch(create_shader)(
    struct panvk_device *dev, nir_shader *nir, struct panvk_shader **shader_out);
+
+struct panvk_shader *panvk_per_arch(polygon_mode_gs)(struct panvk_device *dev, bool points);
+struct panvk_shader *panvk_per_arch(xfb_passthrough_gs)(struct panvk_device *dev,
+                                                        const struct panvk_shader_variant *vs,
+                                                        enum mesa_prim prim);
+void panvk_per_arch(destroy_xfb_passthrough_gs)(struct panvk_device *dev);
 
 #endif

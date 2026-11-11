@@ -11,36 +11,33 @@ subdir('c11/impl')
 subdir('android_stub')
 subdir('util')
 
-inc_mesa = include_directories('mesa')
+# mali-panvk: src/mesa, src/gallium (except include) and src/virtio (except virtio-gpu)
+# are not shipped in this PanVK-only tree.
+inc_mesa = []
 inc_src = include_directories('.')
 inc_gallium = include_directories('gallium/include')
-inc_gallium_aux = include_directories('gallium/auxiliary')
-inc_amd_common = include_directories('amd/common', 'amd/common/nir')
+inc_gallium_aux = []
+inc_amd_common = []  # mali-panvk: amd/common, amd/common/nir not shipped
 inc_tool = include_directories('tool')
-inc_virtio = include_directories('virtio')
+inc_virtio = []
 inc_virtio_gpu = include_directories('virtio/virtio-gpu')
-inc_frontends = include_directories('gallium/frontends')
+inc_frontends = []
 pps_datasources = []
 pps_includes = []
 
-inc_llvmpipe = include_directories('gallium/drivers/llvmpipe')
+inc_llvmpipe = []
 
 if dep_llvm.found()
-  inc_amd_common_llvm = include_directories('amd/llvm')
+  inc_amd_common_llvm = []  # mali-panvk: amd/llvm not shipped
 else
   inc_amd_common_llvm = []
 endif
 
-inc_radv_bvh = include_directories('amd/vulkan/bvh')
-inc_radv_tools = include_directories('amd/vulkan/tools')
+inc_radv_bvh = []  # mali-panvk: amd/vulkan/bvh not shipped
+inc_radv_tools = []  # mali-panvk: amd/vulkan/tools not shipped
 inc_vulkan_bvh = include_directories('vulkan/runtime/bvh')
 
-glsl_util_files = files(
-    'mesa/main/extensions_table.c',
-    'mesa/program/prog_parameter.c',
-    'mesa/program/symbol_table.c',
-    'mesa/program/dummy_errors.c',
-)
+glsl_util_files = []
 
 sha1_h = custom_target(
   'git_sha1.h',

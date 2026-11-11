@@ -8,6 +8,7 @@ libpankmod_lib_code = [
   'pan_kmod.c',
   'panfrost_kmod.c',
   'panthor_kmod.c',
+  'kbase_kmod.c',
 ]
 
 if with_panfrost_vdrm

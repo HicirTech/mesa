@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <xf86drm.h>
 
 #include "util/cache_ops.h"
@@ -18,6 +20,7 @@ extern const struct pan_kmod_ops panthor_kmod_ops;
 extern const struct pan_kmod_ops panfrost_virtio_gpu_ops;
 extern const struct pan_kmod_ops panfrost_vpipe_ops;
 #endif /* HAVE_PANFROST_VDRM */
+extern const struct pan_kmod_ops kbase_kmod_ops;
 
 static const struct backend {
    const char *name;
@@ -70,6 +73,20 @@ static const struct pan_kmod_allocator default_allocator = {
    .free = default_free,
 };
 
+/* Whether fd is a kbase node: what /proc/self/fd says it is, /dev/mali0 on every Arm Android
+ * device seen so far. */
+static bool
+pan_kmod_fd_is_kbase(int fd)
+{
+   char link[64], target[64];
+   snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+   const ssize_t n = readlink(link, target, sizeof(target) - 1);
+   if (n <= 0)
+      return false;
+   target[n] = 0;
+   return !strncmp(target, "/dev/mali", 9);
+}
+
 struct pan_kmod_dev *
 pan_kmod_dev_create(int fd, uint32_t flags,
                     const struct pan_kmod_allocator *allocator)
@@ -79,6 +96,15 @@ pan_kmod_dev_create(int fd, uint32_t flags,
 
    if (!allocator)
       allocator = &default_allocator;
+
+   /* kbase (ARM's own kernel driver, /dev/mali*) is not DRM. It is recognised by its node and
+    * never handed to the DRM backends: drmGetVersion() on a kbase fd that already carries a
+    * context returns a name that is not a string, and the DRM backends strcmp() it. */
+   if (pan_kmod_fd_is_kbase(fd)) {
+      if (pan_kmod_backend_is_enabled(selected_backends, "kbase"))
+         dev = kbase_kmod_ops.dev_create(fd, flags, allocator);
+      return dev;
+   }
 
    for (int i = 0; i < ARRAY_SIZE(backends); i++) {
       if (pan_kmod_backend_is_enabled(selected_backends, backends[i].name))

@@ -37,6 +37,10 @@ struct pan_compile_inputs {
    const struct pan_model *model;
    bool is_blend, is_blit;
    bool no_idvs;
+   /* A vertex shader feeding an emulated geometry stage: leave gl_Position in clip space. The
+    * viewport transform belongs to the stage that feeds the tiler, and applying it here as well
+    * loses the position whenever a scale is 0 (rasterizer discard, a flat depth range). */
+   bool vs_keep_clip_space;
    uint32_t view_mask;
 
    /* Number of colour buffers gl_FragColor broadcasts to.  Only useful for
@@ -85,6 +89,11 @@ void pan_shader_compile(nir_shader *nir, struct pan_compile_inputs *inputs,
                         struct pan_shader_info *info);
 
 #define PAN_PRINTF_BUFFER_SIZE 16384
+
+/* Invocations per compute workgroup every Bifrost and later GPU runs,
+ * whatever the register usage.
+ */
+#define PAN_MAX_HW_WORKGROUP_SIZE 256
 
 /* Any address with the top bit set is treated OOB by the hardware when
  * accessed from a shader and any reads will return zero and writes will be
@@ -516,6 +525,13 @@ struct pan_shader_info {
           * Stays zero for shaders that are not built by panfrost_compile.
           */
          uint8_t precomp_num_workgroups_mask;
+
+         /* Nonzero when the workgroup was larger than the hardware runs and
+          * the shader was lowered to a 1D workgroup of this many invocations,
+          * each doing the work of several (nir_lower_workgroup_size). It has
+          * to be dispatched at this size, not the API's.
+          */
+         uint16_t real_workgroup_size;
       } cs;
    };
 

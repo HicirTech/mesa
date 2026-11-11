@@ -36,6 +36,14 @@ option(
 )
 
 option(
+  'xclipse-gralloc-deps',
+  type : 'string',
+  value : '',
+  description : 'Path to gralloc build deps (include/, libs/, abi_override/) that compile the '
+              + 'IMapper4 gralloc backend into an android-stub build. Empty = disabled.',
+)
+
+option(
   'android-strict',
   type : 'boolean',
   value : true,

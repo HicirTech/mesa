@@ -25,12 +25,15 @@
 #include "util/memstream.h"
 #include "util/mesa-blake3.h"
 #include "util/shader_stats.h"
+#include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "util/u_hexdump.h"
 #include "util/u_memory.h"
 #include "nir_builder.h"
+#include "nir_builtin_builder.h"
 #include "nir_conversion_builder.h"
 #include "nir_deref.h"
+#include "nir_xfb_info.h"
 
 #include "shader_enums.h"
 #include "vk_graphics_state.h"
@@ -38,6 +41,7 @@
 #include "vk_shader_module.h"
 #include "vk_ycbcr_conversion.h"
 
+#include "poly/nir/poly_nir.h"
 #include "compiler/bifrost/bifrost_nir.h"
 #include "compiler/bifrost/bifrost_compile.h"
 #include "compiler/pan_compiler.h"
@@ -360,6 +364,17 @@ panvk_buffer_ubo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
    }
 }
 
+/* A null SSBO (nullDescriptor) is address 0 with size 0 before v9: only the bounds-checked address
+ * format keeps accesses through it off address 0, so it is used whenever null descriptors are. */
+static inline VkPipelineRobustnessBufferBehaviorEXT
+panvk_ssbo_robustness(const struct vk_pipeline_robustness_state *rs)
+{
+   if (PAN_ARCH < 9 && rs->null_storage_buffer_descriptor &&
+       rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+      return VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
+   return rs->storage_buffers;
+}
+
 static inline nir_address_format
 panvk_buffer_ssbo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
 {
@@ -376,6 +391,34 @@ panvk_buffer_ssbo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
    }
 }
 
+/* The vertex streams a geometry shader emits on, from its EmitStreamVertex/EndStreamPrimitive
+ * themselves: nir->info.gs.active_stream_mask is not gathered yet where this is needed. */
+static unsigned
+gs_stream_mask(nir_shader *nir)
+{
+   unsigned mask = 1;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_emit_vertex:
+            case nir_intrinsic_end_primitive:
+            case nir_intrinsic_emit_vertex_with_counter:
+            case nir_intrinsic_end_primitive_with_counter:
+               mask |= 1u << nir_intrinsic_stream_id(intr);
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return mask;
+}
+
 static const nir_shader_compiler_options *
 panvk_get_nir_options(UNUSED struct vk_physical_device *vk_pdev,
                       mesa_shader_stage stage,
@@ -384,18 +427,31 @@ panvk_get_nir_options(UNUSED struct vk_physical_device *vk_pdev,
    return pan_get_nir_shader_compiler_options(PAN_ARCH, stage, false);
 }
 
+/* RelaxedPrecision runs in 16 bits: ALU, texture results and fragment colour outputs, as the
+ * vendor driver does (Mali-G57: a mediump textured fill shader runs 20% faster there, and not at
+ * all faster here before this). PANVK_NO_MEDIUMP=1 keeps everything 32-bit. */
+DEBUG_GET_ONCE_BOOL_OPTION(panvk_no_mediump, "PANVK_NO_MEDIUMP", false)
+
+static bool
+panvk_mediump_16bit(void)
+{
+   return !debug_get_option_panvk_no_mediump();
+}
+
 static struct spirv_to_nir_options
 panvk_get_spirv_options(UNUSED struct vk_physical_device *vk_pdev,
                         UNUSED mesa_shader_stage stage,
                         const struct vk_pipeline_robustness_state *rs)
 {
    return (struct spirv_to_nir_options){
+      .mediump_16bit_alu = panvk_mediump_16bit(),
       .ubo_addr_format = panvk_buffer_ubo_addr_format(rs->uniform_buffers),
-      .ssbo_addr_format = panvk_buffer_ssbo_addr_format(rs->storage_buffers),
+      .ssbo_addr_format = panvk_buffer_ssbo_addr_format(panvk_ssbo_robustness(rs)),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .shared_addr_format = nir_address_format_32bit_offset,
       .min_ubo_alignment = 16,
-      .min_ssbo_alignment = 16,
+      /* Matches minStorageBufferOffsetAlignment. */
+      .min_ssbo_alignment = PAN_ARCH >= 9 ? 4 : 16,
       .debug_info = pan_want_debug_info(PAN_ARCH),
    };
 }
@@ -484,6 +540,83 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
             core_max_id);
 
    pan_preprocess_nir(nir, PAN_ARCH);
+
+   /* A float texture result that is only used in 16 bits (RelaxedPrecision math) is returned
+    * in 16 bits: half the registers, and the texture unit's 16-bit path. */
+   if (panvk_mediump_16bit()) {
+      nir_opt_16bit_tex_image_options opt_16bit = {
+         .rounding_mode = nir_rounding_mode_undef,
+         .opt_tex_dest_types = nir_type_float,
+      };
+      bool progress = false;
+      NIR_PASS(progress, nir, nir_opt_16bit_tex_image, &opt_16bit);
+      if (progress) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+}
+
+/* Float colour outputs can reach the blend unit as f16 when every colour
+ * attachment is UNORM/SRGB with at most 8 bits per channel: f16 keeps 11
+ * mantissa bits, so the stored value moves by at most one LSB (the same
+ * trade AMD makes with its FP16 export for 8-bit targets). It halves the
+ * BLEND staging registers, worth ~13% of blended fill on the G725 (v10+ only,
+ * where it was measured). Needs the formats at compile time, so shader
+ * objects and FS-only libraries keep f32.
+ */
+static bool
+panvk_fs_color_f16(const struct vk_graphics_pipeline_state *state)
+{
+   if (PAN_ARCH < 10 || !state || !state->rp ||
+       !vk_render_pass_state_has_attachment_info(state->rp))
+      return false;
+
+   bool any = false;
+   for (unsigned i = 0; i < state->rp->color_attachment_count; i++) {
+      VkFormat vkfmt = state->rp->color_attachment_formats[i];
+      if (vkfmt == VK_FORMAT_UNDEFINED)
+         continue;
+
+      const struct util_format_description *desc =
+         util_format_description(vk_format_to_pipe_format(vkfmt));
+      if (!desc || !desc->is_unorm)
+         return false;
+      for (unsigned c = 0; c < desc->nr_channels; c++) {
+         if (desc->channel[c].size > 8)
+            return false;
+      }
+      any = true;
+   }
+   return any;
+}
+
+static bool
+lower_fs_color_f16(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_src_type(intr) != nir_type_float32 ||
+       nir_intrinsic_io_semantics(intr).location < FRAG_RESULT_DATA0)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[0], nir_f2f16_rtne(b, intr->src[0].ssa));
+   nir_intrinsic_set_src_type(intr, nir_type_float16);
+   return true;
+}
+
+/* Polygon modes go through the geometry shader emulation (panvk_per_arch(polygon_mode_gs)), so a
+ * vertex shader that may draw in one carries the PANVK_VS_VARIANT_POLY_* variants. This decides
+ * what gets compiled, so panvk_hash_state hashes it. */
+static bool
+vs_may_draw_polygon_mode(const struct vk_features *features,
+                         const struct vk_graphics_pipeline_state *state)
+{
+   if (!features->fillModeNonSolid)
+      return false;
+   if (!state || !state->rs || BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE))
+      return true;
+   return state->rs->polygon_mode != VK_POLYGON_MODE_FILL;
 }
 
 static void
@@ -510,6 +643,19 @@ panvk_hash_state(struct vk_physical_device *device,
 
       if (state->ial)
          _mesa_blake3_update(&blake3_ctx, state->ial, sizeof(*state->ial));
+
+      if (stages & VK_SHADER_STAGE_FRAGMENT_BIT) {
+         const bool color_f16 = panvk_fs_color_f16(state);
+         _mesa_blake3_update(&blake3_ctx, &color_f16, sizeof(color_f16));
+      }
+   }
+
+   const bool mediump_16bit = panvk_mediump_16bit();
+   _mesa_blake3_update(&blake3_ctx, &mediump_16bit, sizeof(mediump_16bit));
+
+   if (PAN_ARCH >= 9 && (stages & VK_SHADER_STAGE_VERTEX_BIT)) {
+      const bool poly = vs_may_draw_polygon_mode(enabled_features, state);
+      _mesa_blake3_update(&blake3_ctx, &poly, sizeof(poly));
    }
 
    _mesa_blake3_final(&blake3_ctx, blake3_out);
@@ -772,6 +918,11 @@ lookup_ycbcr_conversion(const void *_state, uint32_t set,
                         uint32_t binding, uint32_t array_index)
 {
    const struct lower_ycbcr_state *state = _state;
+
+   /* Descriptor heap embedded samplers: no YCbCr conversion support. */
+   if (set == VK_NIR_YCBCR_SET_IMMUTABLE_SAMPLERS)
+      return NULL;
+
    assert(set < state->set_layout_count);
    assert(state->set_layouts[set] != NULL);
    const struct panvk_descriptor_set_layout *set_layout =
@@ -806,6 +957,80 @@ glsl_type_size(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+/* robustImageAccess2 for storage images: out-of-bounds loads return zero (with 1 in the
+ * components the format lacks), stores and atomics are dropped. */
+static bool
+is_robust_image_intr(const nir_intrinsic_instr *intr, UNUSED const void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* robustImageAccess2 for texel fetches: an out-of-bounds coordinate, level or sample reads
+ * zero. The fetch itself goes to texel 0 of level 0, so it never leaves the image. */
+static bool
+lower_robust_txf(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+{
+   if ((tex->op != nir_texop_txf && tex->op != nir_texop_txf_ms) ||
+       tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+      return false;
+
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (offset_idx >= 0) {
+      coord = nir_iadd(b, coord, nir_pad_vector_imm_int(b, tex->src[offset_idx].src.ssa, 0,
+                                                       coord->num_components));
+      nir_tex_instr_remove_src(tex, offset_idx);
+   }
+
+   const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   nir_def *lod = lod_idx >= 0 ? tex->src[lod_idx].src.ssa : nir_imm_int(b, 0);
+
+   nir_def *size = nir_build_texture_query(b, tex, nir_texop_txs, coord->num_components,
+                                           nir_type_int32, false, true);
+   nir_tex_instr *txs = nir_instr_as_tex(nir_def_instr(size));
+   nir_src_rewrite(&txs->src[nir_tex_instr_src_index(txs, nir_tex_src_lod)].src, lod);
+   nir_def *levels = nir_build_texture_query(b, tex, nir_texop_query_levels, 1,
+                                             nir_type_int32, false, false);
+
+   nir_def *in_bounds =
+      nir_iand(b, nir_ball(b, nir_ult(b, coord, size)), nir_ult(b, lod, levels));
+
+   const int ms_idx = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
+   if (ms_idx >= 0) {
+      nir_def *samples = nir_build_texture_query(b, tex, nir_texop_texture_samples, 1,
+                                                 nir_type_int32, false, false);
+      nir_def *s = tex->src[ms_idx].src.ssa;
+      in_bounds = nir_iand(b, in_bounds, nir_ult(b, s, samples));
+      nir_src_rewrite(&tex->src[ms_idx].src, nir_bcsel(b, in_bounds, s, nir_imm_int(b, 0)));
+   }
+
+   nir_src_rewrite(&tex->src[nir_tex_instr_src_index(tex, nir_tex_src_coord)].src,
+                   nir_bcsel(b, in_bounds, coord, nir_imm_zero(b, coord->num_components, 32)));
+   if (lod_idx >= 0)
+      nir_src_rewrite(&tex->src[nir_tex_instr_src_index(tex, nir_tex_src_lod)].src,
+                      nir_bcsel(b, in_bounds, lod, nir_imm_int(b, 0)));
+
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *zero = nir_imm_zero(b, tex->def.num_components, tex->def.bit_size);
+   nir_def *res = nir_bcsel(b, in_bounds, &tex->def, zero);
+   nir_def_rewrite_uses_after(&tex->def, res);
+   return true;
+}
+
 static void
 panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
                 uint32_t set_layout_count,
@@ -837,6 +1062,11 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, lookup_ycbcr_conversion,
             &ycbcr_state);
 
+   if (rs->images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2) {
+      NIR_PASS(_, nir, nir_lower_robust_access, is_robust_image_intr, NULL);
+      NIR_PASS(_, nir, nir_shader_tex_pass, lower_robust_txf, nir_metadata_control_flow, NULL);
+   }
+
    /* We need to do this before nir_lower_descriptors so any image_deref_size
     * intrinsics generated can be lowered there.
     */
@@ -853,7 +1083,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             panvk_buffer_ubo_addr_format(rs->uniform_buffers));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            panvk_buffer_ssbo_addr_format(rs->storage_buffers));
+            panvk_buffer_ssbo_addr_format(panvk_ssbo_robustness(rs)));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
@@ -863,7 +1093,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
     * descriptor-level bounds check Mali HW does for native buffer
     * loads/stores is bypassed. Insert software bounds checks here for SSBO
     * accesses when robust storage buffer access is requested. */
-   if (rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
+   if (panvk_ssbo_robustness(rs) != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
       NIR_PASS(_, nir, nir_lower_robust_access, is_robust_ssbo_intr, NULL);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
@@ -970,7 +1200,413 @@ panvk_lower_nir_io(nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_constant_folding);
 
    pan_nir_lower_mediump_io(nir);
+
+   /* RelaxedPrecision colour outputs reach the blend unit in 16 bits; the blend descriptor
+    * follows the type (fs_info->bifrost.blend[].type). Before pan_nir_lower_fs_outputs. */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && panvk_mediump_16bit())
+      NIR_PASS(_, nir, nir_lower_mediump_io, nir_var_shader_out, 0, false);
 }
+
+static VkResult
+panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+                  VkShaderCreateFlagsEXT shader_flags,
+                  const struct pan_compile_inputs *compile_input,
+                  const struct vk_graphics_pipeline_state *state,
+                  const uint32_t *noperspective_varyings,
+                  struct panvk_shader_desc_info *desc_info,
+                  struct panvk_shader_variant *shader);
+
+#if PAN_ARCH >= 9
+/*
+ * Geometry shader emulation on v9. Valhall's tiler takes vertices from a MALLOC_VERTEX job's
+ * position shader and nothing else, so the Bifrost arrangement (vertex job writes varying
+ * buffers, a compute job runs the geometry shader over them, the tiler reads what it wrote) is
+ * rebuilt around that:
+ *
+ *  - the vertex shader is compiled a second way for a pipeline with a geometry shader: no IDVS,
+ *    run as a COMPUTE job (one invocation per vertex record, y the instance), every output
+ *    stored to memory in the record layout the emulation reads (panvk_gs_push in_pos and
+ *    in_general: position at 16 bytes a record, one 16-byte slot per generic location);
+ *  - the geometry shader is the same lowered compute shader as on Bifrost, leaving clip-space
+ *    positions;
+ *  - and the geometry shader carries a second variant, a vertex shader that reads its output
+ *    vertices back by vertex index and hands them to the tiler, drawn as an indexed MALLOC_VERTEX
+ *    job over the emulation's index buffer. The fragment shader is linked against it.
+ */
+
+/* One 16-byte slot per generic location in `written`, in location order. */
+static uint32_t
+v9_gs_record_layout(uint64_t written, uint32_t *offsets)
+{
+   uint32_t stride = 0;
+   for (unsigned i = 0; i < 64; i++)
+      offsets[i] = PANVK_GS_SLOT_UNUSED;
+   u_foreach_bit64(loc, written) {
+      if ((loc < VARYING_SLOT_VAR0 && loc != PANVK_GS_VIEWPORT_INDEX_SLOT &&
+           loc != VARYING_SLOT_CLIP_DIST0 && loc != VARYING_SLOT_CLIP_DIST1) ||
+          loc >= 64)
+         continue;
+      offsets[loc] = stride;
+      stride += 16;
+   }
+   return stride;
+}
+
+static bool
+v9_collect_vs_outputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   uint64_t *written = data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   const unsigned loc =
+      sem.location + (nir_src_is_const(intr->src[1]) ? nir_src_as_uint(intr->src[1]) : 0);
+   if (loc < 64)
+      *written |= BITFIELD64_BIT(loc);
+   return false;
+}
+
+static void
+v9_store_record(nir_builder *b, nir_def *base, nir_def *byte, nir_def *val)
+{
+   for (unsigned c = 0; c < val->num_components; c++) {
+      nir_def *addr = nir_iadd(b, base, nir_u2u64(b, nir_iadd_imm(b, byte, c * 4)));
+      nir_store_global(b, nir_channel(b, val, c), addr, .align_mul = 4, .write_mask = 0x1);
+   }
+}
+
+static bool
+v9_lower_vs_to_record(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct panvk_shader_variant *v = data;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_vertex_id:
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(&intr->def,
+                      nir_iadd(b, nir_load_raw_vertex_id(b),
+                               load_sysval(b, graphics, 32, vs.first_vertex)));
+      return true;
+   case nir_intrinsic_load_vertex_id_zero_base:
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(&intr->def, nir_load_raw_vertex_id(b));
+      return true;
+   case nir_intrinsic_store_output:
+      break;
+   default:
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   const unsigned loc =
+      sem.location + (nir_src_is_const(intr->src[1]) ? nir_src_as_uint(intr->src[1]) : 0);
+   nir_def *val = intr->src[0].ssa;
+   const nir_alu_type type = nir_intrinsic_src_type(intr);
+
+   if (val->bit_size == 16) {
+      switch (nir_alu_type_get_base_type(type)) {
+      case nir_type_float:
+         val = nir_f2f32(b, val);
+         break;
+      case nir_type_int:
+         val = nir_i2i32(b, val);
+         break;
+      default:
+         val = nir_u2u32(b, val);
+         break;
+      }
+   }
+
+   const bool is_pos = loc == VARYING_SLOT_POS;
+   const bool is_generic = loc < 64 && v->gs.rec_offsets[loc] != PANVK_GS_SLOT_UNUSED;
+   if (val->bit_size == 32 && (is_pos || is_generic)) {
+      nir_def *rec =
+         nir_iadd(b, nir_load_raw_vertex_id(b),
+                  nir_imul(b, nir_load_instance_id(b),
+                           load_sysval(b, graphics, 32, gs_io.instance_stride)));
+      const unsigned comp = nir_intrinsic_component(intr) * 4;
+      if (is_pos) {
+         v9_store_record(b, load_sysval(b, graphics, 64, gs_io.pos),
+                         nir_iadd_imm(b, nir_imul_imm(b, rec, 16), comp), val);
+      } else {
+         v9_store_record(b, load_sysval(b, graphics, 64, gs_io.general),
+                         nir_iadd_imm(b, nir_imul_imm(b, rec, v->gs.rec_stride),
+                                      v->gs.rec_offsets[loc] + comp),
+                         val);
+      }
+   }
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+/* The vertex shader of a pipeline with a geometry shader: records instead of varyings. */
+static void
+v9_lower_vs_for_gs(nir_shader *nir, struct panvk_shader_variant *variant)
+{
+   uint64_t written = 0;
+   nir_shader_intrinsics_pass(nir, v9_collect_vs_outputs, nir_metadata_all, &written);
+   variant->gs.rec_stride = v9_gs_record_layout(written, variant->gs.rec_offsets);
+   variant->gs.vs_for_gs = true;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, v9_lower_vs_to_record,
+            nir_metadata_control_flow, variant);
+   nir->info.outputs_written = 0;
+}
+
+struct v9_gs_out {
+   unsigned loc;
+   unsigned ncomp;
+};
+
+/* The geometry shader's generic outputs, before the lowering turns them into stores. */
+static unsigned
+v9_collect_gs_outputs(nir_shader *nir, struct v9_gs_out *outs, uint64_t *written)
+{
+   unsigned n = 0;
+   *written = 0;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.compact || var->data.location < VARYING_SLOT_VAR0)
+         continue;
+      const struct glsl_type *type = var->type;
+      const unsigned elems = glsl_type_is_array(type) ? glsl_get_length(type) : 1;
+      const struct glsl_type *elem = glsl_type_is_array(type) ? glsl_get_array_element(type) : type;
+      if (!glsl_type_is_vector_or_scalar(elem) || glsl_get_bit_size(elem) != 32)
+         continue;
+      for (unsigned e = 0; e < elems; e++) {
+         const unsigned loc = var->data.location + e;
+         if (loc >= 64)
+            continue;
+         const unsigned ncomp = var->data.location_frac + glsl_get_vector_elements(elem);
+         bool found = false;
+         for (unsigned i = 0; i < n; i++) {
+            if (outs[i].loc == loc) {
+               outs[i].ncomp = MAX2(outs[i].ncomp, ncomp);
+               found = true;
+            }
+         }
+         if (!found && n < 32)
+            outs[n++] = (struct v9_gs_out){.loc = loc, .ncomp = MIN2(ncomp, 4)};
+         *written |= BITFIELD64_BIT(loc);
+      }
+   }
+   return n;
+}
+
+static nir_def *
+v9_load_record(nir_builder *b, nir_def *base, nir_def *byte, unsigned ncomp)
+{
+   nir_def *c[4];
+   for (unsigned i = 0; i < ncomp; i++) {
+      nir_def *addr = nir_iadd(b, base, nir_u2u64(b, nir_iadd_imm(b, byte, i * 4)));
+      c[i] = nir_load_global(b, 1, 32, addr, .align_mul = 4);
+   }
+   return nir_vec(b, c, ncomp);
+}
+
+/* The rasterization variant of a geometry shader: output vertex gl_VertexIndex of the emulation,
+ * position and generic slots, raw 32-bit words (the fragment shader's own format reads them). */
+static VkResult
+v9_build_gs_rast(struct panvk_device *dev, const struct v9_gs_out *outs, unsigned n,
+                 const struct panvk_shader_variant *gs, VkShaderCreateFlagsEXT flags,
+                 const struct pan_compile_inputs *gs_inputs,
+                 const struct vk_graphics_pipeline_state *state,
+                 const uint32_t *noperspective_varyings,
+                 const struct vk_pipeline_robustness_state *rs,
+                 struct panvk_shader_variant *variant)
+{
+   const nir_shader_compiler_options *opts =
+      pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_VERTEX, false);
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, opts, "panvk-gs-rast");
+   b.shader->info.internal = true;
+
+   nir_def *vid = nir_load_vertex_id(&b);
+   nir_def *pos_base = load_sysval(&b, graphics, 64, gs_io.pos);
+   nir_def *gen_base = load_sysval(&b, graphics, 64, gs_io.general);
+
+   nir_variable *pos =
+      nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "gl_Position");
+   pos->data.location = VARYING_SLOT_POS;
+   nir_def *clip = v9_load_record(&b, pos_base, nir_imul_imm(&b, vid, 16), 4);
+
+   /* gl_ViewportIndex. The hardware applies viewport 0's transform, so the position moves in
+    * clip space to where viewport i's transform puts it, and the index goes on to the fragment
+    * shader, which discards outside that viewport (panvk_nir_lower_viewport_scissor_fs). The
+    * transforms are the table in front of the rectangles (prepare_gs_viewports). */
+   if (gs->gs.writes_viewport) {
+      nir_def *byte = nir_iadd_imm(&b, nir_imul_imm(&b, vid, gs->gs.rec_stride),
+                                   gs->gs.rec_offsets[PANVK_GS_VIEWPORT_INDEX_SLOT]);
+      nir_def *idx = v9_load_record(&b, gen_base, byte, 1);
+      nir_variable *vpi = nir_variable_create(b.shader, nir_var_shader_out, glsl_uint_type(),
+                                              "panvk_viewport_index");
+      vpi->data.location = PANVK_GS_VIEWPORT_INDEX_SLOT;
+      vpi->data.interpolation = INTERP_MODE_FLAT;
+      nir_store_var(&b, vpi, idx, 0x1);
+
+      nir_def *rects = load_sysval(&b, graphics, 64, fs.viewport_rects);
+      nir_push_if(&b, nir_ine_imm(&b, rects, 0));
+      nir_def *moved;
+      {
+         nir_def *xf0 = nir_iadd_imm(&b, rects, -(int64_t)(PANVK_GS_MAX_VIEWPORTS * 24));
+         nir_def *i = nir_umin(&b, idx, nir_imm_int(&b, PANVK_GS_MAX_VIEWPORTS - 1));
+         nir_def *xfi = nir_iadd(&b, xf0, nir_u2u64(&b, nir_imul_imm(&b, i, 24)));
+         nir_def *w = nir_channel(&b, clip, 3);
+         nir_def *c[4];
+         for (unsigned k = 0; k < 3; k++) {
+            nir_def *s0 = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, xf0, k * 4), .align_mul = 4);
+            nir_def *o0 =
+               nir_load_global(&b, 1, 32, nir_iadd_imm(&b, xf0, 12 + k * 4), .align_mul = 4);
+            nir_def *si = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, xfi, k * 4), .align_mul = 4);
+            nir_def *oi =
+               nir_load_global(&b, 1, 32, nir_iadd_imm(&b, xfi, 12 + k * 4), .align_mul = 4);
+            nir_def *v = nir_channel(&b, clip, k);
+            nir_def *m = nir_fdiv(&b, nir_ffma(&b, si, v, nir_fmul(&b, nir_fsub(&b, oi, o0), w)), s0);
+            c[k] = nir_bcsel(&b, nir_feq_imm(&b, s0, 0.0), v, m);
+         }
+         c[3] = w;
+         moved = nir_vec(&b, c, 4);
+      }
+      nir_pop_if(&b, NULL);
+      clip = nir_if_phi(&b, moved, clip);
+   }
+   nir_store_var(&b, pos, clip, 0xf);
+
+   for (unsigned i = 0; i < n; i++) {
+      char name[16];
+      snprintf(name, sizeof(name), "o%u", outs[i].loc);
+      nir_variable *var = nir_variable_create(
+         b.shader, nir_var_shader_out, glsl_vector_type(GLSL_TYPE_UINT, outs[i].ncomp), name);
+      var->data.location = outs[i].loc;
+      nir_def *byte = nir_iadd_imm(&b, nir_imul_imm(&b, vid, gs->gs.rec_stride),
+                                   gs->gs.rec_offsets[outs[i].loc]);
+      nir_store_var(&b, var, v9_load_record(&b, gen_base, byte, outs[i].ncomp),
+                    BITFIELD_MASK(outs[i].ncomp));
+   }
+
+   nir_shader *nir = b.shader;
+   struct panvk_shader_desc_info desc_info = {0};
+   panvk_lower_nir(dev, nir, 0, NULL, rs, state, &desc_info, false);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
+   panvk_lower_nir_io(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+
+   struct pan_compile_inputs inputs = *gs_inputs;
+   inputs.no_idvs = false;
+   struct pan_varying_layout varying_layout;
+   pan_varying_collect_formats(&varying_layout, nir, inputs.arch);
+   pan_build_varying_layout_compact(&varying_layout, nir, inputs.arch);
+   inputs.varying_layout = &varying_layout;
+
+   variant->own_bin = true;
+   VkResult result = panvk_compile_nir(dev, nir, flags, &inputs, state, noperspective_varyings,
+                                       &desc_info, variant);
+   ralloc_free(nir);
+   return result;
+}
+
+static enum glsl_base_type
+v9_slot_glsl_type(nir_alu_type t)
+{
+   const bool half = nir_alu_type_get_type_size(t) == 16;
+   switch (nir_alu_type_get_base_type(t)) {
+   case nir_type_float:
+      return half ? GLSL_TYPE_FLOAT16 : GLSL_TYPE_FLOAT;
+   case nir_type_int:
+      return half ? GLSL_TYPE_INT16 : GLSL_TYPE_INT;
+   default:
+      return half ? GLSL_TYPE_UINT16 : GLSL_TYPE_UINT;
+   }
+}
+
+/* The polygon-mode rasterization variant of a vertex shader: output vertex gl_VertexIndex of the
+ * emulation, read back from records in the layout the emulation variant wrote (the polygon-mode
+ * geometry shader copies them through unchanged), and written out slot for slot in the HW
+ * variant's varying layout -- same locations, same driver locations, same formats -- so the
+ * fragment shader linked against the HW variant reads them as it would its own. */
+static VkResult
+v9_build_vs_poly_rast(struct panvk_device *dev, const struct panvk_shader_variant *rec,
+                      const struct panvk_shader_variant *hw, VkShaderCreateFlagsEXT flags,
+                      const struct pan_compile_inputs *vs_inputs,
+                      const struct vk_graphics_pipeline_state *state,
+                      const uint32_t *noperspective_varyings,
+                      const struct vk_pipeline_robustness_state *rs,
+                      struct panvk_shader_variant *variant)
+{
+   const nir_shader_compiler_options *opts =
+      pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_VERTEX, false);
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_VERTEX, opts, "panvk-vs-poly-rast");
+   b.shader->info.internal = true;
+
+   nir_def *vid = nir_load_vertex_id(&b);
+   nir_def *pos_base = load_sysval(&b, graphics, 64, gs_io.pos);
+   nir_def *gen_base = load_sysval(&b, graphics, 64, gs_io.general);
+
+   const struct pan_varying_layout *layout = &hw->info.varyings.formats;
+   for (unsigned i = 0; i < layout->count; i++) {
+      const struct pan_varying_slot *slot = &layout->slots[i];
+      if (pan_varying_slot_is_empty(slot))
+         continue;
+
+      const unsigned loc = slot->location;
+      const unsigned bits = nir_alu_type_get_type_size(slot->alu_type);
+      const unsigned ncomp = slot->ncomps;
+      nir_def *val;
+      if (loc == VARYING_SLOT_POS) {
+         val = v9_load_record(&b, pos_base, nir_imul_imm(&b, vid, 16), 4);
+      } else if (loc == VARYING_SLOT_PSIZ) {
+         /* Not recorded: points drawn in VK_POLYGON_MODE_POINT are one pixel. */
+         val = nir_imm_floatN_t(&b, 1.0, bits);
+      } else if (loc < 64 && rec->gs.rec_offsets[loc] != PANVK_GS_SLOT_UNUSED) {
+         nir_def *byte = nir_iadd_imm(&b, nir_imul_imm(&b, vid, rec->gs.rec_stride),
+                                      rec->gs.rec_offsets[loc]);
+         val = v9_load_record(&b, gen_base, byte, ncomp);
+         if (bits == 16) {
+            switch (nir_alu_type_get_base_type(slot->alu_type)) {
+            case nir_type_float:
+               val = nir_f2f16(&b, val);
+               break;
+            case nir_type_int:
+               val = nir_i2i16(&b, val);
+               break;
+            default:
+               val = nir_u2u16(&b, val);
+               break;
+            }
+         }
+      } else {
+         val = nir_imm_zero(&b, ncomp, bits);
+      }
+      if (val->num_components != ncomp)
+         val = nir_trim_vector(&b, val, ncomp);
+
+      char name[16];
+      snprintf(name, sizeof(name), "o%u", loc);
+      nir_variable *var = nir_variable_create(
+         b.shader, nir_var_shader_out,
+         glsl_vector_type(v9_slot_glsl_type(slot->alu_type), ncomp), name);
+      var->data.location = loc;
+      var->data.driver_location = i;
+      nir_store_var(&b, var, val, BITFIELD_MASK(ncomp));
+   }
+
+   nir_shader *nir = b.shader;
+   struct panvk_shader_desc_info desc_info = {0};
+   panvk_lower_nir(dev, nir, 0, NULL, rs, state, &desc_info, false);
+   panvk_lower_nir_io(nir);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+
+   struct pan_compile_inputs inputs = *vs_inputs;
+   inputs.no_idvs = false;
+   struct pan_varying_layout varying_layout = *layout;
+   inputs.varying_layout = &varying_layout;
+
+   variant->own_bin = true;
+   VkResult result = panvk_compile_nir(dev, nir, flags, &inputs, state, noperspective_varyings,
+                                       &desc_info, variant);
+   ralloc_free(nir);
+   return result;
+}
+#endif
 
 static VkResult
 panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
@@ -1370,18 +2006,210 @@ panvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
 
 #if PAN_ARCH < 9
    panvk_pool_free_mem(&shader->desc_info.others.map);
+#else
+   panvk_pool_free_mem(&shader->desc_info.embedded_samplers.descs);
 #endif
 
    vk_shader_free(vk_dev, pAllocator, &shader->vk);
 }
 
+#if PAN_ARCH >= 9
+/* The PANVK_HEAP_EMBEDDED_TABLE contents: a default sampler (see
+ * lower_heap_tex) followed by the embedded samplers. */
+static VkResult
+upload_embedded_samplers(struct panvk_device *dev, struct panvk_shader *shader,
+                         const struct mali_sampler_packed *descs,
+                         uint32_t count)
+{
+   shader->desc_info.uses_heaps = true;
+   shader->desc_info.embedded_samplers.count = count;
+   shader->desc_info.embedded_samplers.descs = panvk_pool_upload_aligned(
+      &dev->mempools.rw, descs, count * sizeof(*descs), PANVK_DESCRIPTOR_SIZE);
+   if (!panvk_priv_mem_check_alloc(shader->desc_info.embedded_samplers.descs))
+      return panvk_error(shader, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   return VK_SUCCESS;
+}
+
+static VkResult
+init_heap_desc_info(struct panvk_device *dev, struct panvk_shader *shader,
+                    const struct vk_shader_compile_info *info)
+{
+   if (!(info->flags & VK_SHADER_CREATE_DESCRIPTOR_HEAP_BIT_EXT))
+      return VK_SUCCESS;
+
+   const uint32_t count = 1 + info->embedded_sampler_count;
+   struct mali_sampler_packed *descs = malloc(count * sizeof(*descs));
+   if (!descs)
+      return panvk_error(shader, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   pan_pack(&descs[0], SAMPLER, cfg) {
+      cfg.clamp_integer_array_indices = false;
+   }
+   for (uint32_t i = 0; i < info->embedded_sampler_count; i++)
+      panvk_per_arch(sampler_state_fill_desc)(&info->embedded_samplers[i],
+                                              &descs[i + 1]);
+
+   VkResult result = upload_embedded_samplers(dev, shader, descs, count);
+   free(descs);
+   return result;
+}
+#endif
+
 static const struct vk_shader_ops panvk_shader_ops;
+
+/*
+ * Clip and cull distances. Mali has no clipping on user planes, so they are done per fragment:
+ * the distances travel to the fragment shader as ordinary varyings in VARYING_SLOT_CLIP_DIST0/1
+ * and it discards.
+ *
+ * A clip distance is exact that way -- the interpolated distance is negative exactly where the
+ * clipped part of the primitive is. A cull distance is not: the primitive goes only when EVERY
+ * vertex is negative, and an interpolated distance is also negative near a single negative
+ * vertex. So the vertex shader writes each cull distance as an indicator instead, 1 for negative
+ * and 0 otherwise. Interpolated with weights that sum to one, it reaches 1 only when all three
+ * vertices are negative, which is the test the fragment shader makes.
+ *
+ * A fragment shader compiled without its vertex shader (graphics pipeline libraries) does not
+ * know which slots are which, and tests all 8 as clip distances: an indicator is never negative
+ * and a slot the vertex shader does not write reads as 0, so clipping stays exact and culling
+ * waits for the linked pipeline.
+ */
+static bool
+panvk_nir_lower_cull_vs(nir_shader *nir, unsigned clip_count)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+
+            nir_deref_instr *d = nir_src_as_deref(intr->src[0]);
+            if (d->deref_type != nir_deref_type_array)
+               continue;
+            nir_variable *var = nir_deref_instr_get_variable(d);
+            if (!var || var->data.mode != nir_var_shader_out || !var->data.compact ||
+                var->data.location != VARYING_SLOT_CLIP_DIST0)
+               continue;
+
+            b.cursor = nir_before_instr(instr);
+            nir_def *v = intr->src[1].ssa;
+            nir_def *index = nir_iadd_imm(&b, d->arr.index.ssa, var->data.location_frac);
+            nir_def *cull = nir_b2f32(&b, nir_flt_imm(&b, v, 0.0));
+            nir_def *out = nir_bcsel(&b, nir_uge_imm(&b, index, clip_count), cull, v);
+            nir_src_rewrite(&intr->src[1], out);
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+
+   return progress;
+}
+
+/*
+ * Several viewports, from a geometry shader writing gl_ViewportIndex. The tiler has one scissor,
+ * set to the union of all of them (panvk_emit_viewport), and the emulation already moved every
+ * vertex with its own viewport's transform; what the tiler cannot do is keep a primitive inside
+ * its own viewport. So the fragment shader discards outside the rectangle its viewport index
+ * names -- the index arrives flat in PANVK_GS_VIEWPORT_INDEX_SLOT, the rectangles in a table the
+ * draw path fills (fs.viewport_rects).
+ */
+static bool
+panvk_nir_lower_viewport_scissor_fs(nir_shader *nir)
+{
+   nir_variable *in =
+      nir_variable_create(nir, nir_var_shader_in, glsl_uint_type(), "panvk_viewport_index");
+   in->data.location = PANVK_GS_VIEWPORT_INDEX_SLOT;
+   in->data.interpolation = INTERP_MODE_FLAT;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   nir_def *rects = load_sysval(&b, graphics, 64, fs.viewport_rects);
+   nir_def *idx = nir_umin(&b, nir_load_var(&b, in), nir_imm_int(&b, PANVK_GS_MAX_VIEWPORTS - 1));
+   nir_def *addr = nir_iadd(&b, rects, nir_u2u64(&b, nir_imul_imm(&b, idx, 16)));
+   nir_def *r[4];
+   for (unsigned i = 0; i < 4; i++)
+      r[i] = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, addr, i * 4), .align_mul = 4);
+
+   nir_def *fc = nir_load_frag_coord(&b);
+   nir_def *x = nir_channel(&b, fc, 0), *y = nir_channel(&b, fc, 1);
+   nir_def *out = nir_ior(&b, nir_ior(&b, nir_flt(&b, x, r[0]), nir_flt(&b, y, r[1])),
+                          nir_ior(&b, nir_fge(&b, x, r[2]), nir_fge(&b, y, r[3])));
+   nir_discard_if(&b, nir_iand(&b, out, nir_ine_imm(&b, rects, 0)));
+
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
+static bool
+panvk_nir_lower_clip_cull_fs(nir_shader *nir, unsigned clip_count, unsigned cull_count)
+{
+   const unsigned total = clip_count + cull_count;
+   if (!total)
+      return false;
+
+   /* A fragment shader that reads gl_ClipDistance itself keeps its own variable. */
+   nir_foreach_shader_in_variable(var, nir) {
+      if (var->data.location == VARYING_SLOT_CLIP_DIST0 ||
+          var->data.location == VARYING_SLOT_CLIP_DIST1)
+         return false;
+   }
+
+   nir_variable *in[2] = {NULL, NULL};
+   for (unsigned s = 0; s < DIV_ROUND_UP(total, 4); s++) {
+      in[s] = nir_variable_create(nir, nir_var_shader_in, glsl_vec4_type(),
+                                  s ? "panvk_clip_dist1" : "panvk_clip_dist0");
+      in[s]->data.location = VARYING_SLOT_CLIP_DIST0 + s;
+      in[s]->data.interpolation = INTERP_MODE_NONE;
+   }
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   nir_def *kill = nir_imm_false(&b);
+   nir_def *vals[2] = {NULL, NULL};
+   for (unsigned i = 0; i < total; i++) {
+      if (!vals[i / 4])
+         vals[i / 4] = nir_load_var(&b, in[i / 4]);
+      nir_def *v = nir_channel(&b, vals[i / 4], i % 4);
+      nir_def *out = i < clip_count ? nir_flt_imm(&b, v, 0.0) : nir_fge_imm(&b, v, 0.9999);
+      kill = nir_ior(&b, kill, out);
+   }
+   nir_discard_if(&b, kill);
+
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
+/* A vertex shader whose transform feedback the pass-through geometry shader can capture when no
+ * geometry or tess stage follows it (panvk_per_arch(xfb_passthrough_gs)). It is compiled for the
+ * emulation (clip space), so every draw with it alone goes that way, capturing or not. */
+static bool
+panvk_vs_xfb_passthrough(const nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_VERTEX || !nir->xfb_info ||
+       !nir->xfb_info->output_count)
+      return false;
+
+   uint32_t table[PANVK_XFB_MAX_RECORD_DWORDS];
+   return nir_xfb_info_size(nir->xfb_info->output_count) <= PANVK_VS_XFB_INFO_QWORDS * 8 &&
+          panvk_gs_xfb_table(nir->xfb_info, table) > 0;
+}
 
 static VkResult
 panvk_compile_shader(struct panvk_device *dev,
                      struct vk_shader_compile_info *info,
                      const struct vk_graphics_pipeline_state *state,
                      const struct pan_varying_layout *vs_varying_layout,
+                     int prev_clip_count, int prev_cull_count, bool prev_gs_viewport,
                      const uint32_t *noperspective_varyings,
                      const VkAllocationCallbacks *pAllocator,
                      struct vk_shader **shader_out)
@@ -1400,25 +2228,102 @@ panvk_compile_shader(struct panvk_device *dev,
    if (shader == NULL)
       return panvk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+#if PAN_ARCH >= 9
+   result = init_heap_desc_info(dev, shader, info);
+   if (result != VK_SUCCESS) {
+      panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+      return result;
+   }
+#endif
+
    nir_variable_mode robust_modes = 0;
    if (info->robustness->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
       robust_modes |= nir_var_mem_ubo;
-   if (info->robustness->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
+   if (panvk_ssbo_robustness(info->robustness) != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
       robust_modes |= nir_var_mem_ssbo;
 
    struct pan_compile_inputs inputs = {
       .arch = PAN_ARCH,
       .model = phys_dev->model,
       .view_mask = (state && state->rp) ? state->mv->view_mask : 0,
+      /* The geometry shader emulation reads the vertex shader's output in clip space and does
+       * the viewport transform itself (panvk_nir_lower_gs.c). next_stage_mask is exact here:
+       * the runtime links every pre-rasterization stage of a pipeline together. */
+      .vs_keep_clip_space = PAN_ARCH < 9 && info->stage == MESA_SHADER_VERTEX &&
+                            ((info->next_stage_mask & (VK_SHADER_STAGE_GEOMETRY_BIT |
+                                                       VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)) ||
+                             panvk_vs_xfb_passthrough(info->nir)),
       .robust_modes = robust_modes,
       .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
+
+      /* IDVS IS OFF ON BIFROST v6/v7, and this is measured, not cautious.
+       *
+       * With IDVS on, a draw produces nothing: the INDEXED_VERTEX job completes with
+       * Exception Status 0x1 and no fault pointer, and the position buffer it should have
+       * filled is still entirely zero afterwards. Nothing in the descriptors explains it --
+       * the position shader is compiled correctly and stores through r58:r59
+       * (ST_CVT.v4 t1, r58, r59), the RSD asks for exactly that preload
+       * (Position result address lo/hi: true), the attributes are fetched, the tiler heap and
+       * context are valid, and wiring draw->position into the VERTEX_DRAW descriptor as well
+       * changes nothing. Turn IDVS off and the identical test renders, matching the vendor
+       * driver pixel for pixel (1682 green, 2414 blue of 4096).
+       *
+       * What decided it: ARM's own driver does not use IDVS on this part either. Its job
+       * chain for the same triangle, read out of its own traffic, is a plain VERTEX job
+       * (header type 5) chained to a TILER job -- not an INDEXED_VERTEX job -- while its
+       * fragment job header is byte-identical to ours. So the path that works here is the
+       * path the hardware vendor actually uses.
+       *
+       * This is a workaround, not a fix: the underlying IDVS problem is unresolved and this
+       * only stops us relying on it. Set PANVK_FORCE_IDVS=1 to put it back for anyone
+       * chasing the real cause -- the failure is silent, so that knob is the only way to
+       * reproduce it. Arch 9+ (Valhall) is untouched; it uses memory-allocated IDVS, which is
+       * a different mechanism entirely.
+       */
+      .no_idvs = PAN_ARCH < 9 && !debug_get_bool_option("PANVK_FORCE_IDVS", false),
    };
 
    switch (info->stage) {
    case MESA_SHADER_VERTEX: {
       const enum panvk_vs_variant last_variant = PANVK_VS_VARIANT_HW;
-      for (enum panvk_vs_variant v = 0; v <= last_variant; v++) {
+      const unsigned clip_count = info->nir->info.clip_distance_array_size;
+      const unsigned cull_count = info->nir->info.cull_distance_array_size;
+      /* Cull distances become indicators for the fragment shader, unless a geometry shader reads
+       * them as they are. */
+      const bool feeds_emulation =
+         inputs.vs_keep_clip_space ||
+         (PAN_ARCH >= 9 && (info->next_stage_mask & (VK_SHADER_STAGE_GEOMETRY_BIT |
+                                                     VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)));
+      if (cull_count && !feeds_emulation) {
+         NIR_PASS(_, info->nir, nir_lower_var_copies);
+         NIR_PASS(_, info->nir, panvk_nir_lower_cull_vs, clip_count);
+      }
+#if PAN_ARCH >= 9
+      /* Polygon modes, and transform feedback with no geometry or tess stage after the vertex
+       * shader (captured by panvk_per_arch(xfb_passthrough_gs)): the emulation variant first
+       * (on a clone), then the HW one. */
+      const bool xfb_pt = !(info->next_stage_mask & (VK_SHADER_STAGE_GEOMETRY_BIT |
+                                                     VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)) &&
+                          panvk_vs_xfb_passthrough(info->nir);
+      const bool poly = !feeds_emulation && (xfb_pt || vs_may_draw_polygon_mode(&dev->vk.enabled_features, state));
+      static const enum panvk_vs_variant order[] = {PANVK_VS_VARIANT_POLY_REC,
+                                                    PANVK_VS_VARIANT_HW};
+#else
+      const bool xfb_pt = panvk_vs_xfb_passthrough(info->nir);
+      const bool poly = false;
+      static const enum panvk_vs_variant order[] = {PANVK_VS_VARIANT_HW};
+#endif
+      for (unsigned o = ARRAY_SIZE(order) - 1 - poly; o < ARRAY_SIZE(order); o++) {
+         const enum panvk_vs_variant v = order[o];
          struct panvk_shader_variant *variant = &shader->variants[v];
+         variant->gs.vs_clip_space = inputs.vs_keep_clip_space;
+         /* v9+: the vertex shader of a geometry shader pipeline feeds no fragment shader. */
+         variant->gs.vs_clip_count = PAN_ARCH >= 9 && feeds_emulation ? 0 : clip_count;
+         variant->gs.vs_cull_count = PAN_ARCH >= 9 && feeds_emulation ? 0 : cull_count;
+         if (xfb_pt) {
+            variant->gs.vs_xfb_size = nir_xfb_info_size(info->nir->xfb_info->output_count);
+            memcpy(variant->gs.vs_xfb_info, info->nir->xfb_info, variant->gs.vs_xfb_size);
+         }
 
          /* Each variant gets its own NIR. To save an extra clone, we use the
           * original NIR for the last stage.
@@ -1470,6 +2375,31 @@ panvk_compile_shader(struct panvk_device *dev,
          /* This somehow folds the location for multi-slot nir_load/nir_store */
          NIR_PASS(_, nir, nir_opt_constant_folding);
 
+#if PAN_ARCH >= 9
+         if ((info->next_stage_mask & (VK_SHADER_STAGE_GEOMETRY_BIT |
+                                       VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)) ||
+             v == PANVK_VS_VARIANT_POLY_REC) {
+            v9_lower_vs_for_gs(nir, variant);
+            struct pan_compile_inputs gs_inputs = inputs;
+            gs_inputs.no_idvs = true;
+            /* No varyings left: every output went to the records. */
+            struct pan_varying_layout no_varyings;
+            pan_varying_collect_formats(&no_varyings, nir, inputs.arch);
+            pan_build_varying_layout_compact(&no_varyings, nir, inputs.arch);
+            gs_inputs.varying_layout = &no_varyings;
+            variant->own_bin = true;
+            result = panvk_compile_nir(dev, nir, info->flags, &gs_inputs, state,
+                                       noperspective_varyings, &shader->desc_info, variant);
+            if (clone_nir)
+               ralloc_free(nir);
+            if (result != VK_SUCCESS) {
+               panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+               return result;
+            }
+            continue;
+         }
+#endif
+
          struct pan_varying_layout varying_layout;
          if (v == PANVK_VS_VARIANT_HW) {
             pan_varying_collect_formats(&varying_layout, nir, PAN_ARCH);
@@ -1492,6 +2422,19 @@ panvk_compile_shader(struct panvk_device *dev,
             return result;
          }
       }
+#if PAN_ARCH >= 9
+      if (poly) {
+         result = v9_build_vs_poly_rast(dev, &shader->variants[PANVK_VS_VARIANT_POLY_REC],
+                                        &shader->variants[PANVK_VS_VARIANT_HW], info->flags,
+                                        &inputs, state, noperspective_varyings,
+                                        info->robustness,
+                                        &shader->variants[PANVK_VS_VARIANT_POLY_RAST]);
+         if (result != VK_SUCCESS) {
+            panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+            return result;
+         }
+      }
+#endif
       break;
    }
 
@@ -1513,6 +2456,19 @@ panvk_compile_shader(struct panvk_device *dev,
                &variant->fs.tile_image_z_read,
                &variant->fs.tile_image_s_read);
 
+      /* Clip and cull distances, see panvk_nir_lower_clip_cull_fs. Unknown counts (a fragment
+       * shader compiled on its own) test all 8 as clip distances, when the application may
+       * use them at all. */
+      if (prev_clip_count < 0) {
+         const bool may_clip = dev->vk.enabled_features.shaderClipDistance ||
+                               dev->vk.enabled_features.shaderCullDistance;
+         prev_clip_count = may_clip ? 8 : 0;
+         prev_cull_count = 0;
+      }
+      NIR_PASS(_, nir, panvk_nir_lower_clip_cull_fs, prev_clip_count, prev_cull_count);
+      if (prev_gs_viewport)
+         NIR_PASS(_, nir, panvk_nir_lower_viewport_scissor_fs);
+
       /* Lower input intrinsics for fragment shaders early to get the max
        * number of varying loads, as this number is required during descriptor
        * lowering for v9+.
@@ -1527,6 +2483,9 @@ panvk_compile_shader(struct panvk_device *dev,
 
       nir_assign_io_var_locations(nir, nir_var_shader_out);
       panvk_lower_nir_io(nir);
+      if (panvk_fs_color_f16(state))
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_fs_color_f16,
+                  nir_metadata_control_flow, NULL);
 
       /* Lower FS outputs now so that we can lower load_blend_descriptor_pan
        * to a driver-provided FAU instead of using the blend descriptors
@@ -1596,6 +2555,268 @@ panvk_compile_shader(struct panvk_device *dev,
          return result;
       }
       variant->info.cs.allow_merging_workgroups = allow_merging_workgroups;
+      break;
+   }
+
+   case MESA_SHADER_GEOMETRY: {
+      /* Mali has no geometry stage, so the shader is lowered into a COMPUTE shader that runs
+       * between the vertex job and the tiler job. See panvk_nir_lower_gs.c. */
+      struct panvk_shader_variant *variant =
+         (struct panvk_shader_variant *)panvk_shader_only_variant(shader);
+      nir_shader *nir = info->nir;
+
+      const unsigned in_verts = mesa_vertices_per_prim(nir->info.gs.input_primitive);
+      const unsigned out_verts = mesa_vertices_per_prim(nir->info.gs.output_primitive);
+
+
+      variant->gs.input_verts_per_prim = in_verts;
+      variant->gs.output_verts_per_prim = out_verts;
+      variant->gs.max_output_verts = nir->info.gs.vertices_out;
+      variant->gs.invocations = MAX2(nir->info.gs.invocations, 1);
+      variant->gs.max_output_prims =
+         nir->info.gs.vertices_out >= out_verts
+            ? nir->info.gs.vertices_out - (out_verts - 1)
+            : 0;
+      /* From the variables, not nir->info: nothing has gathered info on this NIR yet, and the
+       * link lays out the fragment shader's inputs from this mask (link_shaders). */
+      variant->gs.outputs_written = 0;
+      nir_foreach_shader_out_variable(var, nir) {
+         if (var->data.compact)
+            continue;
+         const unsigned slots = glsl_count_attribute_slots(var->type, false);
+         variant->gs.outputs_written |= BITFIELD64_RANGE(var->data.location, slots);
+      }
+      /* gl_ViewportIndex reaches the fragment shader in a slot of its own. */
+      variant->gs.writes_viewport =
+         variant->gs.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT);
+      if (variant->gs.writes_viewport)
+         variant->gs.outputs_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      variant->gs.output_prim = nir->info.gs.output_primitive;
+
+      const int xfb_dwords = panvk_gs_xfb_table(nir->xfb_info, variant->gs.xfb_table);
+      if (xfb_dwords < 0) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "this geometry shader's transform feedback cannot be captured");
+      }
+      variant->gs.xfb_dwords = xfb_dwords;
+      for (unsigned b = 0; b < 4; b++) {
+         variant->gs.xfb_strides[b] =
+            nir->xfb_info && (nir->xfb_info->buffers_written & BITFIELD_BIT(b))
+               ? nir->xfb_info->buffers[b].stride
+               : 0;
+         variant->gs.xfb_buffer_stream[b] = nir->xfb_info ? nir->xfb_info->buffer_to_stream[b] : 0;
+      }
+      variant->gs.stream_mask = gs_stream_mask(nir);
+
+#if PAN_ARCH >= 9
+      struct v9_gs_out v9_outs[32];
+      uint64_t v9_written;
+      const unsigned v9_nouts = v9_collect_gs_outputs(nir, v9_outs, &v9_written);
+      if (variant->gs.writes_viewport)
+         v9_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      variant->gs.rec_stride = v9_gs_record_layout(v9_written, variant->gs.rec_offsets);
+#endif
+
+      const struct panvk_gs_lower_options gs_opts = {
+         .stream_mask = variant->gs.stream_mask,
+         .input_verts_per_prim = in_verts,
+         .output_verts_per_prim = out_verts,
+         .max_output_verts = variant->gs.max_output_verts,
+         .max_output_prims = variant->gs.max_output_prims,
+         .invocations = MAX2(nir->info.gs.invocations, 1),
+         .pos_stride = sizeof(uint32_t) * 4,
+         .hardpos = getenv("PANVK_GS_HARDPOS") != NULL,
+         .echo = getenv("PANVK_GS_ECHO") != NULL,
+         .has_psiz = false,
+         .params_base = SYSVALS_PUSH_CONST_BASE +
+                        offsetof(struct panvk_compute_sysvals, gs),
+         .xfb = nir->xfb_info,
+      };
+
+      if (!panvk_nir_lower_gs(nir, &gs_opts)) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "this geometry shader could not be lowered");
+      }
+
+      /* It is a compute shader from here on, so it takes the compute path verbatim;
+       * panvk_compile_nir() picks up the workgroup size the lowering set. */
+      panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
+                      info->robustness, state, &shader->desc_info, false);
+
+      variant->own_bin = true;
+      result = panvk_compile_nir(dev, nir, info->flags, &inputs, state,
+                                 noperspective_varyings, &shader->desc_info,
+                                 variant);
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+#if PAN_ARCH >= 9
+      result = v9_build_gs_rast(dev, v9_outs, v9_nouts, variant, info->flags, &inputs, state,
+                                noperspective_varyings, info->robustness,
+                                &shader->variants[1]);
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+#endif
+      break;
+   }
+   case MESA_SHADER_TESS_CTRL: {
+      /* A compute shader after the vertex job: one workgroup per patch, one invocation per
+       * output vertex, writing src/poly's output record. See panvk_gs.h. */
+      struct panvk_shader_variant *variant =
+         (struct panvk_shader_variant *)panvk_shader_only_variant(shader);
+      nir_shader *nir = info->nir;
+
+      variant->gs.tess_prim = nir->info.tess._primitive_mode;
+      variant->gs.tess_spacing = nir->info.tess.spacing;
+      variant->gs.tess_ccw = nir->info.tess.ccw;
+      variant->gs.tess_point_mode = nir->info.tess.point_mode;
+      variant->gs.tcs_vertices_out = nir->info.tess.tcs_vertices_out;
+
+      NIR_PASS(_, nir, nir_lower_var_copies);
+      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_shader_in, UINT32_MAX);
+      NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, glsl_type_size, 0);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+      variant->gs.tcs_per_vertex_outputs = poly_tcs_per_vertex_outputs(nir);
+      variant->gs.tcs_nr_patch_outputs = util_last_bit(nir->info.patch_outputs_written);
+      variant->gs.tcs_output_stride = poly_tcs_output_stride(nir);
+
+      const struct panvk_gs_lower_options tcs_opts = {
+         .input_verts_per_prim = 0,
+         .pos_stride = sizeof(uint32_t) * 4,
+         .params_base = SYSVALS_PUSH_CONST_BASE + offsetof(struct panvk_compute_sysvals, gs),
+      };
+      NIR_PASS(_, nir, panvk_nir_lower_tcs_inputs, &tcs_opts);
+      NIR_PASS(_, nir, poly_nir_lower_tcs, false);
+      NIR_PASS(_, nir, panvk_nir_lower_tess_params, &tcs_opts);
+
+      const unsigned local_size = MAX2(variant->gs.tcs_vertices_out, 1);
+      nir->info.stage = MESA_SHADER_COMPUTE;
+      memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+      nir->info.workgroup_size[0] = local_size;
+      nir->info.workgroup_size[1] = 1;
+      nir->info.workgroup_size[2] = 1;
+      nir->info.workgroup_size_variable = false;
+      nir->info.outputs_written = 0;
+      nir->info.inputs_read = 0;
+
+      panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
+                      info->robustness, state, &shader->desc_info, false);
+
+      variant->own_bin = true;
+      result = panvk_compile_nir(dev, nir, info->flags, &inputs, state,
+                                 noperspective_varyings, &shader->desc_info, variant);
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+      break;
+   }
+
+   case MESA_SHADER_TESS_EVAL: {
+      /* Run once per tessellator index as a point-in, point-out geometry shader: the geometry
+       * shader emulation then writes the tiler's buffers. See panvk_gs.h. */
+      struct panvk_shader_variant *variant =
+         (struct panvk_shader_variant *)panvk_shader_only_variant(shader);
+      nir_shader *nir = info->nir;
+
+      variant->gs.tess_prim = nir->info.tess._primitive_mode;
+      variant->gs.tess_spacing = nir->info.tess.spacing;
+      variant->gs.tess_ccw = nir->info.tess.ccw;
+      variant->gs.tess_point_mode = nir->info.tess.point_mode;
+
+      NIR_PASS(_, nir, nir_lower_var_copies);
+      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_shader_in, UINT32_MAX);
+      NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in, glsl_type_size, 0);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, poly_nir_lower_tes, false);
+      panvk_nir_tes_to_gs(nir);
+
+      variant->gs.input_verts_per_prim = 1;
+      variant->gs.output_verts_per_prim = 1;
+      variant->gs.max_output_verts = 1;
+      variant->gs.max_output_prims = 1;
+      variant->gs.invocations = 1;
+      variant->gs.outputs_written = 0;
+      nir_foreach_shader_out_variable(var, nir) {
+         if (var->data.compact)
+            continue;
+         const unsigned slots = glsl_count_attribute_slots(var->type, false);
+         variant->gs.outputs_written |= BITFIELD64_RANGE(var->data.location, slots);
+      }
+      variant->gs.writes_viewport =
+         variant->gs.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT);
+      if (variant->gs.writes_viewport)
+         variant->gs.outputs_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      variant->gs.output_prim = MESA_PRIM_POINTS;
+
+      const int xfb_dwords = panvk_gs_xfb_table(nir->xfb_info, variant->gs.xfb_table);
+      if (xfb_dwords < 0) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "this tess eval shader's transform feedback cannot be captured");
+      }
+      variant->gs.xfb_dwords = xfb_dwords;
+      for (unsigned b = 0; b < 4; b++)
+         variant->gs.xfb_strides[b] =
+            nir->xfb_info && (nir->xfb_info->buffers_written & BITFIELD_BIT(b))
+               ? nir->xfb_info->buffers[b].stride
+               : 0;
+      variant->gs.stream_mask = 1;
+
+#if PAN_ARCH >= 9
+      /* v9+: the records the rasterization variant (or a geometry shader after it) reads, laid
+       * out as a geometry shader's. */
+      struct v9_gs_out v9_outs[32];
+      uint64_t v9_written;
+      const unsigned v9_nouts = v9_collect_gs_outputs(nir, v9_outs, &v9_written);
+      if (variant->gs.writes_viewport)
+         v9_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      variant->gs.rec_stride = v9_gs_record_layout(v9_written, variant->gs.rec_offsets);
+#endif
+
+      const struct panvk_gs_lower_options tes_opts = {
+         .stream_mask = 1,
+         .input_verts_per_prim = 1,
+         .output_verts_per_prim = 1,
+         .max_output_verts = 1,
+         .max_output_prims = 1,
+         .invocations = 1,
+         .pos_stride = sizeof(uint32_t) * 4,
+         .params_base = SYSVALS_PUSH_CONST_BASE + offsetof(struct panvk_compute_sysvals, gs),
+         .xfb = nir->xfb_info,
+      };
+      if (!panvk_nir_lower_gs(nir, &tes_opts)) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return panvk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "this tess eval shader could not be lowered");
+      }
+
+      panvk_lower_nir(dev, nir, info->set_layout_count, info->set_layouts,
+                      info->robustness, state, &shader->desc_info, false);
+
+      variant->own_bin = true;
+      result = panvk_compile_nir(dev, nir, info->flags, &inputs, state,
+                                 noperspective_varyings, &shader->desc_info, variant);
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+#if PAN_ARCH >= 9
+      result = v9_build_gs_rast(dev, v9_outs, v9_nouts, variant, info->flags, &inputs, state,
+                                noperspective_varyings, info->robustness,
+                                &shader->variants[1]);
+      if (result != VK_SUCCESS) {
+         panvk_shader_destroy(&dev->vk, &shader->vk, pAllocator);
+         return result;
+      }
+#endif
       break;
    }
 
@@ -1690,10 +2911,20 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
        * find a varying layout we can use instead of making up our own.
        */
       const struct pan_varying_layout *vs_varying_layout = NULL;
+      /* Clip/cull distances the stage before the FS writes; -1 when it is not known here. A
+       * geometry shader passes none on (the emulation does not carry them yet). */
+      int prev_clip_count = -1, prev_cull_count = -1;
+      bool prev_gs_viewport = false;
       if (infos[i].stage == MESA_SHADER_FRAGMENT && i > 0 &&
           infos[i - 1].next_stage_mask == VK_SHADER_STAGE_FRAGMENT_BIT) {
          struct panvk_shader *prev_shader =
             container_of(shaders_out[i - 1], struct panvk_shader, vk);
+
+         if (infos[i - 1].stage == MESA_SHADER_GEOMETRY ||
+             infos[i - 1].stage == MESA_SHADER_TESS_EVAL) {
+            prev_clip_count = prev_cull_count = 0;
+            prev_gs_viewport = panvk_shader_only_variant(prev_shader)->gs.writes_viewport;
+         }
 
          /* The last geometry stage before the FS will always have a HW vertex
           * shader variant.
@@ -1702,12 +2933,15 @@ compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
             if (variant->info.stage == MESA_SHADER_VERTEX) {
                vs_varying_layout = &variant->info.varyings.formats;
                pan_varying_layout_require_layout(vs_varying_layout);
+               prev_clip_count = variant->gs.vs_clip_count;
+               prev_cull_count = variant->gs.vs_cull_count;
                break;
             }
          }
       }
 
       result = panvk_compile_shader(dev, &infos[i], state, vs_varying_layout,
+                                    prev_clip_count, prev_cull_count, prev_gs_viewport,
                                     noperspective_varyings_ptr, pAllocator,
                                     &shaders_out[i]);
 
@@ -1828,6 +3062,18 @@ shader_desc_info_deserialize(struct panvk_device *dev,
                    sizeof(*shader->desc_info.dyn_bufs.map) *
                       shader->desc_info.dyn_bufs.count);
    shader->desc_info.fs_varying_attr_desc_count = blob_read_uint32(blob);
+
+   const uint32_t embedded_count = blob_read_uint32(blob);
+   if (embedded_count) {
+      const struct mali_sampler_packed *descs = blob_read_bytes(
+         blob, embedded_count * sizeof(struct mali_sampler_packed));
+      if (blob->overrun)
+         return panvk_error(shader, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      VkResult result =
+         upload_embedded_samplers(dev, shader, descs, embedded_count);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 #endif
 
    return VK_SUCCESS;
@@ -1849,6 +3095,9 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
 
    shader->info = info;
    blob_copy_bytes(blob, &shader->fau, sizeof(shader->fau));
+   /* A lowered geometry shader is a COMPUTE variant; what the draw path needs to run it lives
+    * here, not in pan_shader_info, so it has to travel with the binary. */
+   blob_copy_bytes(blob, &shader->gs, sizeof(shader->gs));
 
    switch (shader->info.stage) {
    case MESA_SHADER_COMPUTE:
@@ -2001,6 +3250,14 @@ shader_desc_info_serialize(struct blob *blob,
                     sizeof(*shader->desc_info.dyn_bufs.map) *
                        shader->desc_info.dyn_bufs.count);
    blob_write_uint32(blob, shader->desc_info.fs_varying_attr_desc_count);
+
+   /* Nonzero exactly when the shader uses heaps. The GPU never writes the
+    * table, so the host copy is current. */
+   const uint32_t embedded_count = shader->desc_info.embedded_samplers.count;
+   blob_write_uint32(blob, embedded_count);
+   blob_write_bytes(
+      blob, panvk_priv_mem_host_addr(shader->desc_info.embedded_samplers.descs),
+      embedded_count * sizeof(struct mali_sampler_packed));
 #endif
 }
 
@@ -2011,6 +3268,7 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
 {
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
    blob_write_bytes(blob, &shader->fau, sizeof(shader->fau));
+   blob_write_bytes(blob, &shader->gs, sizeof(shader->gs));
 
    switch (shader->info.stage) {
    case MESA_SHADER_COMPUTE:
@@ -2188,6 +3446,15 @@ panvk_shader_get_executable_statistics(
       needs_vary ? &variant->info.stats_idvs_varying : &variant->info.stats;
 
    vk_add_pan_stats(out, stats);
+
+   /* The per-thread stack, which the stack allocation multiplies by every thread slot of every
+    * core ID: 768 x 23 on the Exynos 9820's G76. */
+   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
+      VK_COPY_STR(stat->name, "Thread-local storage");
+      VK_COPY_STR(stat->description, "Bytes of stack per thread: spills and scratch");
+      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
+      stat->value.u64 = variant->info.tls_size;
+   }
    return vk_outarray_status(&out);
 }
 
@@ -2323,11 +3590,21 @@ varying_format(gl_varying_slot loc, enum pipe_format pfmt)
    }
 }
 
+/* Slots laid out in the generic varying buffer: user varyings, and the clip/cull distances,
+ * which Mali has no fixed-function use for (see panvk_nir_lower_clip_cull_fs). */
+static inline bool
+varying_is_generic(gl_varying_slot loc)
+{
+   return loc >= VARYING_SLOT_VAR0 || loc == VARYING_SLOT_CLIP_DIST0 ||
+          loc == VARYING_SLOT_CLIP_DIST1 || loc == PANVK_GS_VIEWPORT_INDEX_SLOT;
+}
+
 static VkResult
 emit_varying_attrs(struct panvk_pool *desc_pool,
                    const struct pan_varying_layout *varyings,
                    const unsigned *bit_sizes, const unsigned *buf_offsets,
-                   struct panvk_priv_mem *mem)
+                   const unsigned *ncomps_limit,
+                   bool pos_clip_space, struct panvk_priv_mem *mem)
 {
    const unsigned varying_count = varyings->count;
    if (!varying_count) {
@@ -2353,14 +3630,18 @@ emit_varying_attrs(struct panvk_pool *desc_pool,
             gl_varying_slot loc = slot->location;
 
             enum pipe_format pfmt = PIPE_FORMAT_NONE;
-            bool is_hw = loc < VARYING_SLOT_VAR0;
+            bool is_hw = !varying_is_generic(loc);
             bool is_present = is_hw || bit_sizes[loc] != 0;
 
             if (is_present && !is_hw) {
                nir_alu_type base_type =
                   nir_alu_type_get_base_type(slot->alu_type);
-               pfmt =
-                  pan_varying_format(base_type | bit_sizes[loc], slot->ncomps);
+               /* A clip distance slot the producer wrote fewer components of: the rest read as
+                * (0, 0, 1), never a negative distance, instead of the next varying's bytes. */
+               const unsigned ncomps =
+                  ncomps_limit && ncomps_limit[loc] ? MIN2(slot->ncomps, ncomps_limit[loc])
+                                                    : slot->ncomps;
+               pfmt = pan_varying_format(base_type | bit_sizes[loc], ncomps);
             }
 
             if (!is_present) {
@@ -2374,6 +3655,12 @@ emit_varying_attrs(struct panvk_pool *desc_pool,
                cfg.buffer_index = varying_buf_id(loc);
                cfg.offset = buf_offsets[loc];
                cfg.format = varying_format(loc, pfmt);
+               /* SNAP_4 is the tiler's fixed-point position: 8 fractional bits. In screen
+                * space that is 1/256 px; in clip space it moved -0.9 to -0.898, measured, and
+                * every geometry shader output with it. The emulation reads plain floats. */
+               if (loc == VARYING_SLOT_POS && pos_clip_space)
+                  cfg.format =
+                     GENX(pan_format_from_pipe_format)(PIPE_FORMAT_R32G32B32A32_FLOAT)->hw;
             }
             cfg.offset_enable = false;
          }
@@ -2386,12 +3673,14 @@ emit_varying_attrs(struct panvk_pool *desc_pool,
 VkResult
 panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
                              const struct panvk_shader_variant *vs,
+                             const struct panvk_shader_variant *gs,
                              const struct panvk_shader_variant *fs,
                              struct panvk_shader_link *link)
 {
    unsigned buf_strides[PANVK_VARY_BUF_MAX] = {0};
    unsigned buf_offsets[VARYING_SLOT_MAX] = {0};
    unsigned buf_sizes[VARYING_SLOT_MAX] = {0};
+   unsigned vs_ncomps[VARYING_SLOT_MAX] = {0};
 
    assert(vs && vs->info.stage == MESA_SHADER_VERTEX);
    assert(!fs || fs->info.stage == MESA_SHADER_FRAGMENT);
@@ -2406,8 +3695,12 @@ panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
    const struct pan_varying_slot *vs_psiz_slot =
       pan_varying_layout_find_slot(vs_layout, VARYING_SLOT_PSIZ);
 
+   /* The position buffer exists even when the vertex shader writes no gl_Position, which is how
+    * DXVK compiles a D3D vertex shader without SV_Position (one that feeds a hull or geometry
+    * shader, or stream output only): the vertex job accesses it regardless, and a NULL buffer
+    * page-faults, which kills every job of the context. */
+   buf_strides[PANVK_VARY_BUF_POSITION] = sizeof(uint32_t) * 4;
    if (vs_pos_slot) {
-      buf_strides[PANVK_VARY_BUF_POSITION] = sizeof(uint32_t) * 4;
       buf_sizes[VARYING_SLOT_POS] =
          nir_alu_type_get_type_size(vs_pos_slot->alu_type);
    }
@@ -2418,10 +3711,23 @@ panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
    }
    buf_strides[PANVK_VARY_BUF_GENERAL] = vs_layout->generic_size_B;
 
+   /* A geometry shader stands between the two: it may read any generic slot the vertex shader
+    * writes, so all of them are kept, and the fragment shader is linked against the emulation's
+    * own output buffer below instead. */
+   if (gs) {
+      for (uint32_t i = 0; i < vs_layout->count; i++) {
+         const struct pan_varying_slot *vs_slot = pan_varying_layout_slot_at(vs_layout, i);
+         if (!vs_slot || vs_slot->location < VARYING_SLOT_VAR0)
+            continue;
+         buf_offsets[vs_slot->location] = vs_slot->offset;
+         buf_sizes[vs_slot->location] = nir_alu_type_get_type_size(vs_slot->alu_type);
+      }
+   }
+
    /* When no fragment shader is present we can just ignore all
     * generic varyings writes.
     */
-   const uint32_t fs_var_count = fs ? fs->info.varyings.formats.count : 0;
+   const uint32_t fs_var_count = !gs && fs ? fs->info.varyings.formats.count : 0;
    for (uint32_t i = 0; i < fs_var_count; i++) {
       const struct pan_varying_slot *fs_var =
          pan_varying_layout_slot_at(&fs->info.varyings.formats, i);
@@ -2430,7 +3736,7 @@ panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
 
       const gl_varying_slot pos = fs_var->location;
       /* Skip special varyings. */
-      if (pos < VARYING_SLOT_VAR0)
+      if (!varying_is_generic(pos))
          continue;
 
       /* Special buffers are handled explicitly before this loop, everything
@@ -2443,22 +3749,54 @@ panvk_per_arch(link_shaders)(struct panvk_pool *desc_pool,
       if (vs_slot) {
          buf_offsets[pos] = vs_slot->offset;
          buf_sizes[pos] = nir_alu_type_get_type_size(vs_slot->alu_type);
+         vs_ncomps[pos] = vs_slot->ncomps;
       }
    }
 
    panvk_shader_link_cleanup(link);
    VkResult result = emit_varying_attrs(desc_pool, vs_layout, buf_sizes,
-                                        buf_offsets, &link->vs.attribs);
+                                        buf_offsets, NULL, vs->gs.vs_clip_space,
+                                        &link->vs.attribs);
    if (result != VK_SUCCESS)
       return result;
+
+   /* The geometry shader's output layout: a vec4 of 32-bit components per location it writes
+    * and the fragment shader reads, which is what the emulation stores (panvk_nir_lower_gs.c). */
+   unsigned gs_sizes[VARYING_SLOT_MAX] = {0};
+   unsigned gs_offsets[VARYING_SLOT_MAX] = {0};
+   link->gs_out_stride = 0;
+   for (unsigned i = 0; i < VARYING_SLOT_MAX; i++)
+      link->gs_out_offsets[i] = PANVK_GS_SLOT_UNUSED;
+   if (gs && fs) {
+      for (uint32_t i = 0; i < fs->info.varyings.formats.count; i++) {
+         const struct pan_varying_slot *fs_var =
+            pan_varying_layout_slot_at(&fs->info.varyings.formats, i);
+         if (!fs_var || !varying_is_generic(fs_var->location) ||
+             !(gs->gs.outputs_written & BITFIELD64_BIT(fs_var->location)))
+            continue;
+         gs_offsets[fs_var->location] = link->gs_out_stride;
+         gs_sizes[fs_var->location] = 32;
+         link->gs_out_offsets[fs_var->location] = link->gs_out_stride;
+         link->gs_out_stride += 16;
+      }
+   }
 
    if (fs) {
       pan_varying_layout_require_format(&fs->info.varyings.formats);
       result = emit_varying_attrs(desc_pool, &fs->info.varyings.formats,
-                                  buf_sizes, buf_offsets, &link->fs.attribs);
+                                  gs ? gs_sizes : buf_sizes, gs ? gs_offsets : buf_offsets,
+                                  gs ? NULL : vs_ncomps, false, &link->fs.attribs);
       if (result != VK_SUCCESS)
          return result;
    }
+
+   /* Hand the slot offsets to the draw path for the geometry shader emulation. With no fragment
+    * shader (rasterizer discard) nothing reads a generic slot, and the table must say so: left
+    * stale, the emulation stored its outputs through a zero-sized buffer at address 0 and the
+    * MMU fault took the whole job chain down, transform feedback included. */
+   for (unsigned i = 0; i < VARYING_SLOT_MAX; i++)
+      link->buf_offsets[i] =
+         buf_sizes[i] ? buf_offsets[i] : PANVK_GS_SLOT_UNUSED;
 
    memcpy(link->buf_strides, buf_strides, sizeof(link->buf_strides));
    return VK_SUCCESS;
@@ -2499,6 +3837,23 @@ panvk_cmd_bind_shader(struct panvk_cmd_buffer *cmd, const mesa_shader_stage stag
          gfx_state_set_dirty(cmd, FS);
          gfx_state_set_dirty(cmd, FS_PUSH_UNIFORMS);
       }
+      break;
+   case MESA_SHADER_GEOMETRY:
+      /* What the application bound; the draw path decides what actually runs
+       * (panvk_select_gs: the polygon-mode shader stands in when there is none). */
+      cmd->state.gfx.gs.app_shader = shader;
+      if (cmd->state.gfx.gs.shader != shader) {
+         cmd->state.gfx.gs.shader = shader;
+         gfx_state_set_dirty(cmd, GS);
+         gfx_state_set_dirty(cmd, GS_PUSH_UNIFORMS);
+      }
+      break;
+   case MESA_SHADER_TESS_CTRL:
+      cmd->state.gfx.tess.tcs = shader;
+      break;
+   case MESA_SHADER_TESS_EVAL:
+      /* It runs through the geometry shader emulation (panvk_select_gs, CSF tess_draw). */
+      cmd->state.gfx.tess.tes = shader;
       break;
    default:
       assert(!"Unsupported stage");
@@ -2618,7 +3973,7 @@ VkResult panvk_per_arch(create_shader)(
    panvk_preprocess_nir(dev->vk.physical, nir, &rs);
 
    struct vk_shader *vk_shader;
-   VkResult result = panvk_compile_shader(dev, &info, NULL, NULL, NULL, NULL,
+   VkResult result = panvk_compile_shader(dev, &info, NULL, NULL, -1, -1, false, NULL, NULL,
                                           &vk_shader);
    if (result != VK_SUCCESS)
       return result;
@@ -2626,4 +3981,254 @@ VkResult panvk_per_arch(create_shader)(
    *shader_out = container_of(vk_shader, struct panvk_shader, vk);
 
    return VK_SUCCESS;
+}
+
+/*
+ * VK_POLYGON_MODE_LINE and _POINT. The tiler only fills triangles, so a triangle draw in either
+ * mode goes through the geometry shader emulation with this internal shader bound: it emits the
+ * triangle's outline as a line strip (0, 1, 2, 0), or its three vertices as points.
+ *
+ * It is ONE shader for every vertex shader: it copies gl_Position and all 32 generic locations,
+ * and the emulation already skips a location the vertex shader does not write (it reads as zero)
+ * and one the fragment shader does not read (no home in the output buffer). Input assembly --
+ * strips, fans, restart, indexed, instanced, indirect -- is the emulation's.
+ *
+ * Culling happens before the polygon mode applies, and the tiler only sees lines and points, so
+ * the shader culls faces itself: the facing is the sign of the triangle's area in framebuffer
+ * coordinates, from the clip-space positions and the viewport scale (a negative height flips it).
+ */
+static nir_shader *
+build_polygon_mode_gs(bool points)
+{
+   const nir_shader_compiler_options *opts =
+      pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_GEOMETRY, false);
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, opts,
+                                                  "panvk_polygon_mode_%s",
+                                                  points ? "point" : "line");
+   nir_shader *nir = b.shader;
+
+   nir->info.gs.input_primitive = MESA_PRIM_TRIANGLES;
+   nir->info.gs.output_primitive = points ? MESA_PRIM_POINTS : MESA_PRIM_LINE_STRIP;
+   nir->info.gs.vertices_in = 3;
+   nir->info.gs.vertices_out = points ? 3 : 4;
+   nir->info.gs.invocations = 1;
+   nir->info.gs.active_stream_mask = 1;
+
+   const struct glsl_type *in_type = glsl_array_type(glsl_vec4_type(), 3, 0);
+   /* v9+ also carries the clip and cull distances, which the rasterization variant hands to the
+    * fragment shader (v9_build_vs_poly_rast). */
+   const unsigned nslots = PAN_ARCH >= 9 ? 35 : 33;
+   nir_variable *in[35], *out[35];
+   for (unsigned i = 0; i < nslots; i++) {
+      const gl_varying_slot loc = i == 0    ? VARYING_SLOT_POS
+                                  : i <= 32 ? VARYING_SLOT_VAR0 + i - 1
+                                            : VARYING_SLOT_CLIP_DIST0 + i - 33;
+      in[i] = nir_variable_create(nir, nir_var_shader_in, in_type, NULL);
+      in[i]->data.location = loc;
+      out[i] = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), NULL);
+      out[i]->data.location = loc;
+   }
+
+   /* The emulation's push block: cull flags and the viewport scale. */
+   const unsigned push = SYSVALS_PUSH_CONST_BASE + offsetof(struct panvk_compute_sysvals, gs);
+   nir_def *cull = nir_load_push_constant(
+      &b, 1, 32, nir_imm_int(&b, 0),
+      .base = push + offsetof(struct panvk_gs_push, polygon_cull), .range = 4);
+   nir_def *scale_x = nir_load_push_constant(
+      &b, 1, 32, nir_imm_int(&b, 0),
+      .base = push + offsetof(struct panvk_gs_push, viewport_scale), .range = 4);
+   nir_def *scale_y = nir_load_push_constant(
+      &b, 1, 32, nir_imm_int(&b, 0),
+      .base = push + offsetof(struct panvk_gs_push, viewport_scale) + 4, .range = 4);
+
+   nir_def *sx[3], *sy[3];
+   for (unsigned k = 0; k < 3; k++) {
+      nir_def *p = nir_load_array_var_imm(&b, in[0], k);
+      nir_def *rw = nir_frcp(&b, nir_channel(&b, p, 3));
+      sx[k] = nir_fmul(&b, nir_fmul(&b, nir_channel(&b, p, 0), rw), scale_x);
+      sy[k] = nir_fmul(&b, nir_fmul(&b, nir_channel(&b, p, 1), rw), scale_y);
+   }
+   /* Twice the shoelace sum; Vulkan's area is minus half of it (framebuffer y points down). */
+   nir_def *sum = nir_imm_float(&b, 0.0);
+   for (unsigned k = 0; k < 3; k++) {
+      const unsigned n = (k + 1) % 3;
+      sum = nir_fadd(&b, sum, nir_fsub(&b, nir_fmul(&b, sx[k], sy[n]),
+                                       nir_fmul(&b, sx[n], sy[k])));
+   }
+   nir_def *ccw = nir_ine_imm(&b, nir_iand_imm(&b, cull, PANVK_GS_FRONT_CCW), 0);
+   nir_def *front = nir_bcsel(&b, ccw, nir_flt_imm(&b, sum, 0.0), nir_fgt_imm(&b, sum, 0.0));
+   nir_def *culled = nir_bcsel(&b, front,
+                               nir_ine_imm(&b, nir_iand_imm(&b, cull, PANVK_GS_CULL_FRONT), 0),
+                               nir_ine_imm(&b, nir_iand_imm(&b, cull, PANVK_GS_CULL_BACK), 0));
+
+   nir_push_if(&b, nir_inot(&b, culled));
+   {
+      static const unsigned line_order[4] = {0, 1, 2, 0};
+      const unsigned count = points ? 3 : 4;
+      for (unsigned v = 0; v < count; v++) {
+         const unsigned k = points ? v : line_order[v];
+         for (unsigned i = 0; i < nslots; i++)
+            nir_store_var(&b, out[i], nir_load_array_var_imm(&b, in[i], k), 0xf);
+         nir_emit_vertex(&b, 0);
+         if (points)
+            nir_end_primitive(&b, 0);
+      }
+      if (!points)
+         nir_end_primitive(&b, 0);
+   }
+   nir_pop_if(&b, NULL);
+
+   return nir;
+}
+
+struct panvk_shader *
+panvk_per_arch(polygon_mode_gs)(struct panvk_device *dev, bool points)
+{
+   simple_mtx_lock(&dev->polygon_gs.lock);
+   if (!dev->polygon_gs.shader[points]) {
+      struct panvk_shader *shader;
+      if (panvk_per_arch(create_shader)(dev, build_polygon_mode_gs(points), &shader) ==
+          VK_SUCCESS)
+         dev->polygon_gs.shader[points] = &shader->vk;
+   }
+   simple_mtx_unlock(&dev->polygon_gs.lock);
+
+   return dev->polygon_gs.shader[points]
+             ? container_of(dev->polygon_gs.shader[points], struct panvk_shader, vk)
+             : NULL;
+}
+
+/*
+ * Transform feedback from a vertex shader with no geometry or tess stage after it. Capture lives
+ * in the geometry shader emulation, which already assembles primitives in draw order (strips,
+ * fans, restart, indexed, instanced, indirect) and keeps the buffer offsets, so such a draw runs
+ * through it with this internal shader bound: it passes each input primitive through unchanged
+ * and carries the vertex shader's nir_xfb_info, so the emulation captures what the vertex shader
+ * declared. Like the polygon-mode shader it copies gl_Position, gl_PointSize and all 32 generic
+ * locations; clip and cull distances pass through on v9+ only, where the rasterization variant
+ * hands them to the fragment shader.
+ */
+struct panvk_xfb_gs_entry {
+   uint32_t size;
+   enum mesa_prim prim;
+   bool psiz;
+   void *info;
+   struct vk_shader *shader;
+};
+
+static nir_shader *
+build_xfb_passthrough_gs(const nir_xfb_info *xfb, enum mesa_prim prim, bool psiz)
+{
+   const unsigned n = mesa_vertices_per_prim(prim);
+   const nir_shader_compiler_options *opts =
+      pan_get_nir_shader_compiler_options(PAN_ARCH, MESA_SHADER_GEOMETRY, false);
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, opts,
+                                                  "panvk_xfb_passthrough_%u", n);
+   nir_shader *nir = b.shader;
+
+   nir->info.gs.input_primitive = prim;
+   nir->info.gs.output_primitive = prim == MESA_PRIM_POINTS  ? MESA_PRIM_POINTS
+                                   : prim == MESA_PRIM_LINES ? MESA_PRIM_LINE_STRIP
+                                                             : MESA_PRIM_TRIANGLE_STRIP;
+   nir->info.gs.vertices_in = n;
+   nir->info.gs.vertices_out = n;
+   nir->info.gs.invocations = 1;
+   nir->info.gs.active_stream_mask = 1;
+   nir->info.has_transform_feedback_varyings = true;
+   for (unsigned i = 0; i < NIR_MAX_XFB_BUFFERS; i++)
+      nir->info.xfb_stride[i] = xfb->buffers[i].stride / 4;
+   nir->xfb_info = ralloc_memdup(nir, xfb, nir_xfb_info_size(xfb->output_count));
+
+   const unsigned nslots = PAN_ARCH >= 9 ? 36 : 34;
+   nir_variable *in[36], *out[36];
+   for (unsigned i = 0; i < nslots; i++) {
+      in[i] = out[i] = NULL;
+      if (i == 1 && !psiz)
+         continue;
+      const gl_varying_slot loc = i == 0    ? VARYING_SLOT_POS
+                                  : i == 1  ? VARYING_SLOT_PSIZ
+                                  : i <= 33 ? VARYING_SLOT_VAR0 + i - 2
+                                            : VARYING_SLOT_CLIP_DIST0 + i - 34;
+      const struct glsl_type *type = i == 1 ? glsl_float_type() : glsl_vec4_type();
+      in[i] = nir_variable_create(nir, nir_var_shader_in, glsl_array_type(type, n, 0), NULL);
+      in[i]->data.location = loc;
+      out[i] = nir_variable_create(nir, nir_var_shader_out, type, NULL);
+      out[i]->data.location = loc;
+   }
+
+   for (unsigned k = 0; k < n; k++) {
+      for (unsigned i = 0; i < nslots; i++)
+         if (in[i])
+            nir_store_var(&b, out[i], nir_load_array_var_imm(&b, in[i], k), i == 1 ? 0x1 : 0xf);
+      nir_emit_vertex(&b, 0);
+   }
+   nir_end_primitive(&b, 0);
+
+   return nir;
+}
+
+static enum mesa_prim
+xfb_passthrough_prim(enum mesa_prim prim)
+{
+   switch (u_reduced_prim(prim)) {
+   case MESA_PRIM_POINTS:
+      return MESA_PRIM_POINTS;
+   case MESA_PRIM_LINES:
+      return MESA_PRIM_LINES;
+   default:
+      return MESA_PRIM_TRIANGLES;
+   }
+}
+
+struct panvk_shader *
+panvk_per_arch(xfb_passthrough_gs)(struct panvk_device *dev, const struct panvk_shader_variant *vs,
+                                   enum mesa_prim draw_prim)
+{
+   const enum mesa_prim prim = xfb_passthrough_prim(draw_prim);
+   /* gl_PointSize only when the vertex shader writes it: one copied from nowhere reads as 0. */
+   const bool psiz = vs->info.vs.writes_point_size;
+   struct vk_shader *found = NULL;
+
+   simple_mtx_lock(&dev->polygon_gs.lock);
+   util_dynarray_foreach(&dev->xfb_gs, struct panvk_xfb_gs_entry, e) {
+      if (e->prim == prim && e->psiz == psiz && e->size == vs->gs.vs_xfb_size &&
+          !memcmp(e->info, vs->gs.vs_xfb_info, e->size)) {
+         found = e->shader;
+         break;
+      }
+   }
+   if (!found) {
+      struct panvk_shader *shader;
+      void *info = malloc(vs->gs.vs_xfb_size);
+      if (info &&
+          panvk_per_arch(create_shader)(
+             dev, build_xfb_passthrough_gs((const nir_xfb_info *)vs->gs.vs_xfb_info, prim, psiz),
+             &shader) == VK_SUCCESS) {
+         memcpy(info, vs->gs.vs_xfb_info, vs->gs.vs_xfb_size);
+         struct panvk_xfb_gs_entry e = {
+            .size = vs->gs.vs_xfb_size,
+            .prim = prim,
+            .psiz = psiz,
+            .info = info,
+            .shader = &shader->vk,
+         };
+         util_dynarray_append(&dev->xfb_gs, e);
+         found = &shader->vk;
+      } else {
+         free(info);
+      }
+   }
+   simple_mtx_unlock(&dev->polygon_gs.lock);
+
+   return found ? container_of(found, struct panvk_shader, vk) : NULL;
+}
+
+void
+panvk_per_arch(destroy_xfb_passthrough_gs)(struct panvk_device *dev)
+{
+   util_dynarray_foreach(&dev->xfb_gs, struct panvk_xfb_gs_entry, e) {
+      vk_shader_destroy(&dev->vk, e->shader, NULL);
+      free(e->info);
+   }
+   util_dynarray_fini(&dev->xfb_gs);
 }

@@ -1,9 +1,8 @@
-.cache
-.vscode*
-*.kdev4
+/build*/
+!/build-support/
+/dist/
+/subprojects/*/
+!/subprojects/packagefiles/
+/subprojects/packagecache/
 *.pyc
-*.pyo
-*.out
-/build
-.venv/
-*.mda.tar
+__pycache__/

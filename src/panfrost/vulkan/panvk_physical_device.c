@@ -13,6 +13,13 @@
 
 #include <sys/stat.h>
 
+#include "util/detect_os.h"
+
+#if DETECT_OS_ANDROID
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+
 #include "util/disk_cache.h"
 #include "util/os_misc.h"
 #include "util/u_atomic.h"
@@ -21,12 +28,16 @@
 #include "vk_android.h"
 #include "vk_device.h"
 #include "vk_drm_syncobj.h"
+#include "kmod/kbase_kmod.h"
+#include "util/u_sync_provider.h"
 #include "vk_enum_defines.h"
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_physical_device.h"
 #include "vk_util.h"
 
+#include "panvk_android.h"
+#include "panvk_bc_emu.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
@@ -66,6 +77,7 @@
 
 PER_ARCH_FUNCS(6);
 PER_ARCH_FUNCS(7);
+PER_ARCH_FUNCS(9);
 PER_ARCH_FUNCS(10);
 PER_ARCH_FUNCS(11);
 PER_ARCH_FUNCS(12);
@@ -76,7 +88,11 @@ static VkResult
 create_kmod_dev(struct panvk_physical_device *device,
                 const struct panvk_instance *instance, drmDevicePtr drm_device)
 {
-   const char *path = drm_device->nodes[DRM_NODE_RENDER];
+   /* A NULL drm_device means the kbase path: a stock Arm Android device has no /dev/dri at all,
+    * and its GPU is ARM's proprietary kbase at PANVK_KBASE_PATH. pan_kmod_dev_create identifies
+    * the node itself. */
+   const char *path =
+      drm_device ? drm_device->nodes[DRM_NODE_RENDER] : PANVK_KBASE_PATH;
    int fd = open(path, O_RDWR | O_CLOEXEC);
    if (fd < 0) {
       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
@@ -112,12 +128,17 @@ get_drm_device_ids(struct panvk_physical_device *device,
 {
    struct stat st;
 
-   if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
+   /* kbase again: there is no render node, so the identity comes from the mali node itself and
+    * there is no primary node to look for. */
+   if (stat(drm_device ? drm_device->nodes[DRM_NODE_RENDER] : PANVK_KBASE_PATH, &st)) {
       return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
                        "failed to query render node stat");
    }
 
    device->drm.render_rdev = st.st_rdev;
+
+   if (!drm_device)
+      return VK_SUCCESS;
 
    if (drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) {
       if (stat(drm_device->nodes[DRM_NODE_PRIMARY], &st)) {
@@ -130,6 +151,37 @@ get_drm_device_ids(struct panvk_physical_device *device,
 
    return VK_SUCCESS;
 }
+
+#if defined(ENABLE_SHADER_CACHE) && DETECT_OS_ANDROID
+/* Upstream keeps the disk shader cache off on Android, and apps have no HOME, so every launch
+ * recompiled every pipeline (the app's and our BC decoders). Give the cache an app-private
+ * directory: $TMPDIR, else the directory this .so was loaded from. Only /data/ paths, never FUSE
+ * external storage, since cache reads run on the compiling thread. MESA_SHADER_CACHE_DISABLE and
+ * MESA_SHADER_CACHE_DIR still win. Same scheme as RADV on Xclipse. */
+static void
+panvk_android_disk_cache_dir(void)
+{
+   char dir[512] = {0};
+   const char *t = getenv("TMPDIR");
+
+   if (t && !strncmp(t, "/data/", 6) && access(t, W_OK) == 0) {
+      snprintf(dir, sizeof(dir), "%s", t);
+   } else {
+      Dl_info info;
+      if (dladdr((void *)panvk_android_disk_cache_dir, &info) && info.dli_fname &&
+          !strncmp(info.dli_fname, "/data/", 6)) {
+         snprintf(dir, sizeof(dir), "%s", info.dli_fname);
+         char *slash = strrchr(dir, '/');
+         if (slash)
+            *slash = '\0';
+         if (access(dir, W_OK) != 0)
+            dir[0] = '\0';
+      }
+   }
+
+   disk_cache_set_default_dir(dir[0] ? dir : NULL);
+}
+#endif
 
 static void
 init_shader_caches(struct panvk_physical_device *device,
@@ -162,6 +214,9 @@ init_shader_caches(struct panvk_physical_device *device,
    _mesa_blake3_format(timestamp, instance->driver_build_sha);
 
    const uint64_t driver_flags = pan_get_compiler_flags(pan_arch(gpu_id));
+#if DETECT_OS_ANDROID
+   panvk_android_disk_cache_dir();
+#endif
    device->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
 #endif
 }
@@ -379,7 +434,9 @@ get_device_sync_types(struct panvk_physical_device *device,
 
    device->sync_types[sync_type_count++] = &device->drm_syncobj_type;
 
-   if (arch >= 10) {
+   /* kbase's in-process syncobjs are binary, on CSF parts too: timelines are emulated there as
+    * on the JM ones. */
+   if (arch >= 10 && !pan_kmod_dev_is_kbase(device->kmod.dev)) {
       assert(device->drm_syncobj_type.features & VK_SYNC_FEATURE_TIMELINE);
    } else {
       /* We don't support timelines in the uAPI yet and we don't want it getting
@@ -454,15 +511,16 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
+   case 9:
    case 11:
    case 14:
-      if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
-         result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                               "WARNING: panvk is not well-tested on v%d, "
-                               "pass PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 "
-                               "if you know what you're doing.", arch);
-         goto fail;
-      }
+      /* Upstream refuses these outright unless PAN_I_WANT_A_BROKEN_VULKAN_DRIVER is set. This
+       * tree keeps the warning and continues, because an app loader has no way to set an
+       * environment variable in the process it is loading the driver into -- and on a device
+       * whose GPU is ARM's kbase, panvk is the only Mesa Vulkan driver there is, so refusing to
+       * enumerate leaves nothing at all. It is still an untested driver on this arch and the
+       * warning says so. */
+      mesa_logw("panvk is not well-tested on v%d -- continuing anyway", arch);
       break;
 
    case 10:
@@ -483,7 +541,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    device->formats.all = pan_format_table(arch);
    device->formats.blendable = pan_blendable_format_table(arch);
 
-   pan_model_device_name(device->name, sizeof(device->name), device->model, core_count, "");
+   /* XCLIPSE: report "PanVK-G76 MC12" rather than "Mali-G76 MC12", so the driver in use can be
+    * told from Arm's at a glance. The model name itself stays "Mali-..." for everything else. */
+   const char *model_name = device->model->name;
+   if (!strncmp(model_name, "Mali-", 5))
+      model_name += 5;
+   snprintf(device->name, sizeof(device->name), "PanVK-%s MC%u", model_name, core_count);
 
    result = get_core_masks(device, instance);
    if (result != VK_SUCCESS)
@@ -530,6 +593,12 @@ panvk_physical_device_init(struct panvk_physical_device *device,
 
    /* initialize disk cache after vk_physical_device_init */
    init_shader_caches(device, instance);
+
+   /* ARM's gralloc (kbase phones) allocates AFBC for GPU-only usage, in a layout we cannot
+    * import, so image AHardwareBuffers ask for a linear one. See panvk_android.c. */
+   if (pan_kmod_dev_is_kbase(device->kmod.dev))
+      device->vk.android_ahb_image_usage =
+         MALI_GRALLOC_USAGE_NO_AFBC | GRALLOC_USAGE_HW_COMPOSER;
 
    /* pipeline binary props rely on disk cache init state */
    panvk_arch_dispatch(arch, get_physical_device_properties, instance, device,
@@ -619,8 +688,9 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
          /* On v10+ we can support up to 127 queues but this causes timeout on
             some CTS tests */
          .queueCount = arch >= 10 ? 2 : 1,
+         /* JM: kbase only (WRITE_VALUE SYSTEM_TIMESTAMP with BASE_JD_REQ_PERMON). */
          .timestampValidBits =
-            arch >= 10 &&
+            (arch >= 10 || pan_kmod_dev_is_kbase(physical_device->kmod.dev)) &&
                   physical_device->kmod.dev->props.gpu_can_query_timestamp
                ? 64
                : 0,
@@ -903,7 +973,10 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
    const struct pan_format fmt = physical_device->formats.all[pfmt];
    unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
 
-   if (!format_is_supported(physical_device, fmt, pfmt))
+   /* BC4-BC7 are emulated where the texture unit has no decoder for them (panvk_bc_emu.h). Their
+    * features are those of any compressed format here: sampled, filtered, transfer, blit source. */
+   const bool bc_emu = panvk_bc_emu_format(physical_device, format);
+   if (!bc_emu && !format_is_supported(physical_device, fmt, pfmt))
       return 0;
 
    if (fmt.bind & PAN_BIND_SAMPLER_VIEW) {
@@ -953,7 +1026,8 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
    if (fmt.bind & PAN_BIND_DEPTH_STENCIL)
       features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-   if (features != 0)
+   /* Not for emulated BC: a host copy would not refill the hidden plane. */
+   if (features != 0 && !bc_emu)
       features |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
 
    return features;
@@ -1281,6 +1355,25 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
       vk_format_get_ycbcr_info(info->format);
 
    const VkImageCreateFlags2KHR image_flags = vk_image_format_info_2_flags(info);
+
+   /* Emulated BC formats (panvk_bc_emu.h): 2D and 3D, optimal and linear, as their native
+    * counterparts. Not 1D (no BC format is), and one allocation, no sparse, no host copies, and
+    * nothing that writes the blocks except copies, which the transcoder follows. A linear image
+    * the host writes is refreshed before each submission on the kbase path only. */
+   if (panvk_bc_emu_format(physical_device, info->format) &&
+       (info->type == VK_IMAGE_TYPE_1D ||
+        (info->tiling == VK_IMAGE_TILING_LINEAR &&
+         !pan_kmod_dev_is_kbase(physical_device->kmod.dev)) ||
+        info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+        (image_flags & (VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR |
+                        VK_IMAGE_CREATE_2_SPARSE_RESIDENCY_BIT_KHR |
+                        VK_IMAGE_CREATE_2_DISJOINT_BIT_KHR)) ||
+        (all_usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))))
+      goto unsupported;
+
    if (image_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR) {
       if (!physical_device->vk.supported_features.sparseBinding)
          goto unsupported;

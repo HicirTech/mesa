@@ -5,6 +5,7 @@
  */
 
 #include "util/macros.h"
+#include "util/os_time.h"
 #include "vk_log.h"
 
 #include "pan_props.h"
@@ -70,7 +71,21 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
       reports_per_query = 1;
       break;
    }
+#else
+   case VK_QUERY_TYPE_TIMESTAMP:
+      /* One WRITE_VALUE SYSTEM_TIMESTAMP (jm/panvk_vX_cmd_query.c). */
+      reports_per_query = 1;
+      break;
 #endif
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      /* Primitives written, primitives needed (panlib_xfb_query_end on JM, zeros on CSF,
+       * which captures nothing). */
+      reports_per_query = 2;
+      break;
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+      /* One value per enabled statistic, in bit order (panvk_pipeline_stats_state). */
+      reports_per_query = MAX2(util_bitcount(pool->vk.pipeline_statistics), 1);
+      break;
    default:
       UNREACHABLE("Unsupported query type");
    }
@@ -157,6 +172,11 @@ panvk_query_wait_for_available(struct panvk_device *dev,
                                struct panvk_query_pool *pool, uint32_t query)
 {
    int64_t abs_timeout_ns = os_time_get_absolute_timeout(PANVK_QUERY_TIMEOUT);
+   /* The availability word is written by the GPU and nothing wakes the CPU for it. Spin
+    * briefly for the common short wait, then sleep with a growing step (up to 1 ms) so a
+    * long wait does not keep a core busy (and the SoC hot) for the whole frame. */
+   unsigned spins = 0;
+   int64_t sleep_us = 20;
 
    while (os_time_get_nano() < abs_timeout_ns) {
       if (panvk_query_is_available(pool, query))
@@ -165,6 +185,11 @@ panvk_query_wait_for_available(struct panvk_device *dev,
       VkResult status = vk_device_check_status(&dev->vk);
       if (status != VK_SUCCESS)
          return status;
+
+      if (++spins > 64) {
+         os_time_sleep(sleep_us);
+         sleep_us = MIN2(sleep_us * 2, 1000);
+      }
    }
 
    return vk_device_set_lost(&dev->vk, "query timeout");
@@ -283,7 +308,27 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
                cpu_write_query_result(dst, 0, flags, src[0].value);
             break;
          }
+#else
+         case VK_QUERY_TYPE_TIMESTAMP: {
+            if (write_results)
+               cpu_write_query_result(dst, 0, flags, src[0].value);
+            break;
+         }
 #endif
+         case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: {
+            if (write_results) {
+               cpu_write_query_result(dst, 0, flags, src[0].value);
+               cpu_write_query_result(dst, 1, flags, src[1].value);
+            }
+            break;
+         }
+         case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
+            if (write_results) {
+               for (uint32_t r = 0; r < util_bitcount(pool->vk.pipeline_statistics); r++)
+                  cpu_write_query_result(dst, r, flags, src[r].value);
+            }
+            break;
+         }
          default:
             UNREACHABLE("Unsupported query type");
          }
@@ -292,8 +337,13 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
       if (!write_results)
          status = VK_NOT_READY;
 
+      const uint32_t avail_idx =
+         pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2
+         : pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS
+            ? util_bitcount(pool->vk.pipeline_statistics)
+            : 1;
       if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
-         cpu_write_query_result(dst, 1, flags, available);
+         cpu_write_query_result(dst, avail_idx, flags, available);
    }
 
    return status;

@@ -10,6 +10,7 @@
 #include "panvk_device_memory.h"
 #include "panvk_entrypoints.h"
 
+#include "kmod/kbase_kmod.h"
 #include "pan_desc.h"
 #include "pan_util.h"
 #include "poly/geometry.h"
@@ -169,7 +170,7 @@ render_state_set_color_attachment(struct panvk_cmd_buffer *cmdbuf,
    render->color_attachments.fmts[index] = fmt;
    render->color_attachments.samples[index] = img->vk.samples;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
    for (uint8_t p = 0; p < ARRAY_SIZE(iview->pview.planes); p++) {
       struct pan_image_plane_ref pref =
          pan_image_view_get_plane(&iview->pview, p);
@@ -361,7 +362,7 @@ render_state_set_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
          MAX2(render->fb.nr_samples,
               pan_image_view_get_nr_samples(&z_iview->pview));
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
       /* Depth plane always comes first. */
       render->fb.bos[render->fb.bo_count++] = z_img->planes[0].mem->bo;
 #endif
@@ -385,8 +386,9 @@ render_state_set_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
          MAX2(render->fb.nr_samples,
               pan_image_view_get_nr_samples(&s_iview->pview));
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
       /* The stencil plane is always last. */
+
       render->fb.bos[render->fb.bo_count++] =
          s_img->planes[s_img->plane_count - 1].mem->bo;
 #endif
@@ -689,7 +691,7 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
    if (z_att || s_att)
       render_state_set_zs_attachments(cmdbuf, z_att, s_att);
 
-   const struct pan_fb_bbox ra_px =
+   struct pan_fb_bbox ra_px =
       pan_fb_bbox_from_xywh(pRenderingInfo->renderArea.offset.x,
                             pRenderingInfo->renderArea.offset.y,
                             pRenderingInfo->renderArea.extent.width,
@@ -698,6 +700,12 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
    if (render->bound_attachments) {
       render->fb.layout.width_px = att_width;
       render->fb.layout.height_px = att_height;
+      /* A render area larger than the attachments is invalid, but apps pass one: MojoLauncher
+       * below 100% resolution renders a window-sized area into a smaller swapchain. Unclipped,
+       * the tiles past the image are written past its memory;
+       * the GPU page fault that follows panics MediaTek kernels (Mali-G615). */
+      ra_px = pan_fb_bbox_clamp(ra_px,
+                                pan_fb_bbox_from_xywh(0, 0, att_width, att_height));
    } else {
       render->fb.layout.width_px = (uint32_t)ra_px.max_x + 1;
       render->fb.layout.height_px = (uint32_t)ra_px.max_y + 1;
@@ -768,6 +776,80 @@ panvk_per_arch(cmd_select_tile_size)(struct panvk_cmd_buffer *cmdbuf)
        * that the sample count didn't change (this should never happen) */
       assert(fb->sample_count == render->fb.nr_samples);
    }
+}
+
+/* This value has been selected to get
+ * dEQP-VK.draw.renderpass.inverted_depth_ranges.nodepthclamp_deltazero passing.
+ */
+#define MIN_DEPTH_CLIP_RANGE 37.7E-06f
+
+/*
+ * Several viewports, from a geometry shader writing gl_ViewportIndex: the emulation's per-viewport
+ * transforms (the same arithmetic as viewport.scale/offset below) and the fragment shader's
+ * per-viewport scissor rectangles, in one allocation. An index past viewportCount gets viewport
+ * 0's, where the spec leaves the result undefined.
+ */
+static void
+prepare_gs_viewports(struct panvk_cmd_buffer *cmdbuf, BITSET_WORD *dirty_sysvals)
+{
+#if PAN_ARCH < 9
+   const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+#else
+   const struct panvk_shader *gs = cmdbuf->state.gfx.gs.app_shader;
+#endif
+   uint64_t rects = 0;
+
+   cmdbuf->state.gfx.gs.viewports = 0;
+   if (gs && panvk_shader_only_variant(gs)->gs.writes_viewport) {
+      const struct vk_rasterization_state *rs = &cmdbuf->vk.dynamic_graphics_state.rs;
+      const struct vk_viewport_state *vp = &cmdbuf->vk.dynamic_graphics_state.vp;
+      struct pan_ptr mem =
+         panvk_cmd_alloc_dev_mem(cmdbuf, desc, PANVK_GS_MAX_VIEWPORTS * (24 + 16), 16);
+
+      if (mem.gpu) {
+         float *xf = mem.cpu;
+         float *rc = xf + PANVK_GS_MAX_VIEWPORTS * 6;
+
+         for (unsigned i = 0; i < PANVK_GS_MAX_VIEWPORTS; i++) {
+            const unsigned v = i < vp->viewport_count ? i : 0;
+            const VkViewport *viewport = &vp->viewports[v];
+            const VkRect2D *scissor = &vp->scissors[v];
+
+            float z_min = viewport->minDepth, z_max = viewport->maxDepth;
+            if (vk_rasterization_state_depth_clip_enable(rs) &&
+                fabsf(z_max - z_min) < MIN_DEPTH_CLIP_RANGE) {
+               float z_sign = z_min <= z_max ? 1.0f : -1.0f;
+               float z_center = CLAMP(0.5f * (z_max + z_min), 0.5f * MIN_DEPTH_CLIP_RANGE,
+                                      1.0f - 0.5f * MIN_DEPTH_CLIP_RANGE);
+               z_min = z_center - 0.5f * z_sign * MIN_DEPTH_CLIP_RANGE;
+               z_max = z_center + 0.5f * z_sign * MIN_DEPTH_CLIP_RANGE;
+            }
+
+            xf[i * 6 + 0] = 0.5f * viewport->width;
+            xf[i * 6 + 1] = 0.5f * viewport->height;
+            xf[i * 6 + 2] =
+               vp->depth_clip_negative_one_to_one ? 0.5f * (z_max - z_min) : z_max - z_min;
+            xf[i * 6 + 3] = 0.5f * viewport->width + viewport->x;
+            xf[i * 6 + 4] = 0.5f * viewport->height + viewport->y;
+            xf[i * 6 + 5] =
+               vp->depth_clip_negative_one_to_one ? 0.5f * (z_min + z_max) : z_min;
+
+            /* The viewport's own rectangle intersected with its scissor. */
+            const float vx0 = viewport->x, vx1 = viewport->x + viewport->width;
+            const float vy0 = MIN2(viewport->y, viewport->y + viewport->height);
+            const float vy1 = MAX2(viewport->y, viewport->y + viewport->height);
+            rc[i * 4 + 0] = MAX2(vx0, (float)scissor->offset.x);
+            rc[i * 4 + 1] = MAX2(vy0, (float)scissor->offset.y);
+            rc[i * 4 + 2] = MIN2(vx1, (float)(scissor->offset.x + scissor->extent.width));
+            rc[i * 4 + 3] = MIN2(vy1, (float)(scissor->offset.y + scissor->extent.height));
+         }
+
+         cmdbuf->state.gfx.gs.viewports = mem.gpu;
+         rects = mem.gpu + PANVK_GS_MAX_VIEWPORTS * 24;
+      }
+   }
+
+   set_gfx_sysval(cmdbuf, dirty_sysvals, fs.viewport_rects, rects);
 }
 
 static void
@@ -851,10 +933,6 @@ prepare_iam_sysvals(struct panvk_cmd_buffer *cmdbuf, BITSET_WORD *dirty_sysvals)
       set_gfx_sysval(cmdbuf, dirty_sysvals, iam[i], iam[i]);
 }
 
-/* This value has been selected to get
- * dEQP-VK.draw.renderpass.inverted_depth_ranges.nodepthclamp_deltazero passing.
- */
-#define MIN_DEPTH_CLIP_RANGE 37.7E-06f
 
 void
 panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
@@ -883,9 +961,12 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
       }
    }
 
-   for (unsigned i = 0; i < MAX_RTS; i++) {
-      set_gfx_sysval(cmdbuf, dirty_sysvals, fs.blend_descs[i],
-                     cmdbuf->state.gfx.fs.blend_descs[i]);
+   if (cmdbuf->state.gfx.fs.blend_descs_dirty) {
+      for (unsigned i = 0; i < MAX_RTS; i++) {
+         set_gfx_sysval(cmdbuf, dirty_sysvals, fs.blend_descs[i],
+                        cmdbuf->state.gfx.fs.blend_descs[i]);
+      }
+      cmdbuf->state.gfx.fs.blend_descs_dirty = false;
    }
 
    if (dyn_gfx_state_dirty(cmdbuf, VP_VIEWPORTS) ||
@@ -963,6 +1044,8 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
    if (dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP))
       prepare_iam_sysvals(cmdbuf, dirty_sysvals);
 
+   prepare_gs_viewports(cmdbuf, dirty_sysvals);
+
    const struct panvk_shader_variant *vs =
       panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
 
@@ -983,13 +1066,15 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
                      fs_desc_state->dyn_ssbos);
    }
 
-   uint32_t used_set_mask = 0;
-   used_set_mask |= cmdbuf->state.gfx.vs.shader->desc_info.used_set_mask;
-   if (fs)
-      used_set_mask |= cmdbuf->state.gfx.fs.shader->desc_info.used_set_mask;
+   /* The set addresses only change with the bound sets or the shaders that use them. */
+   if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS) ||
+       gfx_state_dirty(cmdbuf, FS) || fs_user_dirty(cmdbuf)) {
+      uint32_t used_set_mask = 0;
+      used_set_mask |= cmdbuf->state.gfx.vs.shader->desc_info.used_set_mask;
+      if (fs)
+         used_set_mask |= cmdbuf->state.gfx.fs.shader->desc_info.used_set_mask;
 
-   for (uint32_t i = 0; i < MAX_SETS; i++) {
-      if (used_set_mask & BITFIELD_BIT(i)) {
+      u_foreach_bit(i, used_set_mask) {
          set_gfx_sysval(cmdbuf, dirty_sysvals, desc.sets[i],
                         desc_state->sets[i]->descs.dev);
       }
@@ -1044,7 +1129,11 @@ panvk_per_arch(CmdBindVertexBuffers2)(VkCommandBuffer commandBuffer,
          cmdbuf->state.gfx.vb.bufs[firstBinding + i].size = panvk_buffer_range(
             buffer, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
       } else {
-         cmdbuf->state.gfx.vb.bufs[firstBinding + i].address = 0;
+         /* A null buffer (nullDescriptor) reads zeros. On Bifrost that is zeroed memory nothing
+          * writes rather than address 0, which the attribute fetch would fault on. */
+         const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+         cmdbuf->state.gfx.vb.bufs[firstBinding + i].address =
+            PAN_ARCH < 9 ? dev->null_descs.zero_addr : 0;
          cmdbuf->state.gfx.vb.bufs[firstBinding + i].size = 0;
       }
    }
@@ -1066,7 +1155,23 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
       cmdbuf->state.gfx.ib.size = panvk_buffer_range(buf, offset, size);
       assert(cmdbuf->state.gfx.ib.size <= UINT32_MAX);
       cmdbuf->state.gfx.ib.dev_addr = panvk_buffer_gpu_ptr(buf, offset);
+
+      /* Every usage through which the GPU could write the buffer. Without any of them, the
+       * contents at execution time are what the CPU wrote, which a streaming index buffer has
+       * written by the time the draw is recorded. */
+      const VkBufferUsageFlags2KHR gpu_writes =
+         VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR |
+         VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT_KHR |
+         VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT_KHR |
+         VK_BUFFER_USAGE_2_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+         VK_BUFFER_USAGE_2_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+         VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR;
+      struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+      cmdbuf->state.gfx.ib.cpu_readable =
+         PAN_ARCH < 10 && pan_kmod_dev_is_kbase(dev->kmod.dev) &&
+         cmdbuf->state.gfx.ib.dev_addr && !(buf->vk.usage & gpu_writes);
    } else {
+      cmdbuf->state.gfx.ib.cpu_readable = false;
       cmdbuf->state.gfx.ib.size = 0;
       /* In case of NullDescriptors, we need to set a non-NULL address and rely
        * on out-of-bounds behavior against the zero size of the buffer. Note

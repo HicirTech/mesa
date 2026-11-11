@@ -7,6 +7,10 @@
 #ifndef PANVK_PHYSICAL_DEVICE_H
 #define PANVK_PHYSICAL_DEVICE_H
 
+/* ARM kbase node. Used when the system exposes no DRM render node at all, which is the
+ * normal case on a stock Arm Android device. */
+#define PANVK_KBASE_PATH "/dev/mali0"
+
 #include <stdint.h>
 #include <sys/types.h>
 

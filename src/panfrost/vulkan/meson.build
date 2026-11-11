@@ -51,6 +51,7 @@ panvk_tracepoints = custom_target(
 
 libpanvk_files = files(
   'panvk_async_bind.c',
+  'panvk_bc_emu.c',
   'panvk_bind_queue.c',
   'panvk_buffer.c',
   'panvk_cmd_pool.c',
@@ -60,6 +61,7 @@ libpanvk_files = files(
   'panvk_instance.c',
   'panvk_mempool.c',
   'panvk_nir_lower_cooperative_matrix.c',
+  'panvk_nir_lower_gs.c',
   'panvk_nir_lower_tile_image.c',
   'panvk_physical_device.c',
   'panvk_priv_bo.c',
@@ -67,6 +69,32 @@ libpanvk_files = files(
   'panvk_wsi.c',
 )
 libpanvk_files += [sha1_h]
+
+# BC emulation (panvk_bc_emu.c): RADV's decoder/transcoder, one variant per carrier plane. PanVK's
+# variants read the lookup tables from a buffer (BC_TABLES_BUFFER): Bifrost copies any constant
+# array indexed with a variable to the stack of every thread.
+libpanvk_files += custom_target(
+  'panvk_bc_tables.h',
+  input : ['panvk_bc_tables_gen.py', bc_decoder_glsl_file],
+  output : 'panvk_bc_tables.h',
+  command : [prog_python, '@INPUT0@', '@INPUT1@', '@OUTPUT@'],
+)
+foreach v : [['u32x4', 'BC_OUT_U32X4'], ['eac', 'BC_OUT_EAC'], ['bc3', 'BC_OUT_BC3'],
+             ['snorm8', 'BC_OUT_SNORM8'], ['f16', 'BC_OUT_F16'], ['astc', 'BC_OUT_ASTC'],
+             ['eac_r', 'BC_OUT_EAC_R']]
+  foreach d : [['', []], ['_3d', ['-DBC_3D']]]
+    libpanvk_files += custom_target(
+      'bc_decoder_@0@@1@_spv.h'.format(v[0], d[0]),
+      input : bc_decoder_glsl_file,
+      output : 'bc_decoder_@0@@1@_spv.h'.format(v[0], d[0]),
+      command : [
+        prog_glslang, '-V', '-S', 'comp', '-x', '-D@0@'.format(v[1]), '-DBC_TABLES_BUFFER', d[1],
+        '-o', '@OUTPUT@', '@INPUT@', glslang_quiet, glslang_depfile,
+      ],
+      depfile : 'bc_decoder_@0@@1@_spv.h.d'.format(v[0], d[0]),
+    )
+  endforeach
+endforeach
 
 panvk_deps = []
 panvk_flags = []
@@ -86,12 +114,11 @@ fifthgen_archs = [12, 13, 14]
 fifthgen_inc_dir = ['fifthgen']
 fifthgen_files = []
 
-jm_archs = [6, 7]
+jm_archs = [6, 7, 9]
 jm_inc_dir = ['jm']
 jm_files = [
   'jm/panvk_vX_cmd_buffer.c',
   'jm/panvk_vX_cmd_dispatch.c',
-  'jm/panvk_vX_cmd_draw.c',
   'jm/panvk_vX_cmd_event.c',
   'jm/panvk_vX_cmd_query.c',
   'jm/panvk_vX_cmd_precomp.c',
@@ -142,7 +169,7 @@ common_per_arch_files = [
   sha1_h,
 ]
 
-foreach arch : [6, 7, 10, 11, 12, 13, 14]
+foreach arch : [6, 7, 9, 10, 11, 12, 13, 14]
   per_arch_files = common_per_arch_files
   inc_panvk_per_arch = []
 
@@ -160,6 +187,8 @@ foreach arch : [6, 7, 10, 11, 12, 13, 14]
   if arch in jm_archs
     inc_panvk_per_arch += jm_inc_dir
     per_arch_files += jm_files
+    # XCLIPSE: v9 draws are Valhall MALLOC_VERTEX jobs on the JM chain.
+    per_arch_files += arch == 9 ? ['jm/panvk_v9_cmd_draw.c'] : ['jm/panvk_vX_cmd_draw.c']
   elif arch in csf_archs
     inc_panvk_per_arch += csf_inc_dir
     per_arch_files += csf_files
@@ -210,6 +239,7 @@ libvulkan_panfrost = shared_library(
     inc_include,
     inc_src,
     inc_panfrost,
+    include_directories('../../amd/vulkan/meta'), # eac_lut.h
   ],
   link_whole : [panvk_per_arch_libs],
   link_with : [
@@ -217,6 +247,7 @@ libvulkan_panfrost = shared_library(
     libpanfrost_decode,
     libpanfrost_lib,
     libpanfrost_compiler,
+    libpoly_nir,
   ],
   dependencies : [
     dep_dl,
@@ -232,6 +263,7 @@ libvulkan_panfrost = shared_library(
     idep_vulkan_runtime,
     idep_vulkan_wsi,
     idep_mesautil,
+    idep_libpoly,
   ],
   c_args : [no_override_init_args, panvk_flags, soong_compat_c_args],
   link_args : [vulkan_icd_link_args, ld_args_bsymbolic, ld_args_gc_sections, ld_args_build_id],

@@ -12,6 +12,7 @@
 #include "vk_device.h"
 #include "vk_meta.h"
 
+#include "panvk_bc_emu.h"
 #include "panvk_blend.h"
 #include "panvk_instance.h"
 #include "panvk_macros.h"
@@ -24,6 +25,7 @@
 
 #include "util/simple_mtx.h"
 #include "util/u_call_once.h"
+#include "util/u_dynarray.h"
 #include "util/u_printf.h"
 #include "util/vma.h"
 
@@ -67,8 +69,44 @@ struct panvk_device {
       struct pan_kmod_allocator allocator;
    } kmod;
 
-   struct panvk_priv_bo *tiler_heap;
+   /* JM tiler heaps. kbase gets two, and batches take turns (tiler_heap_next): a vertex/tiler
+    * job may then run while the previous batch's fragment job still reads the other one. The DRM
+    * path has [0] only. */
+   struct panvk_priv_bo *tiler_heap[2];
+   unsigned tiler_heap_next;
    struct panvk_priv_bo *sample_positions;
+   /* v6/v7 tessellation: the domain points and index buffers the tessellator writes, reused by
+    * every batch (see panlib_tess_prefix_sum). */
+   struct panvk_priv_bo *tess_heap;
+
+   /* v6/v7: the internal geometry shaders that draw triangles as lines ([0]) or points ([1]) for
+    * VK_POLYGON_MODE_LINE/POINT, built on first use (panvk_per_arch(polygon_mode_gs)). */
+   struct {
+      simple_mtx_t lock;
+      struct vk_shader *shader[2];
+   } polygon_gs;
+
+   /* v6/v7: the internal pass-through geometry shaders that capture the transform feedback of a
+    * vertex shader with no geometry or tess stage after it, one per xfb layout and input
+    * primitive class, built on first use (panvk_per_arch(xfb_passthrough_gs)). Under
+    * polygon_gs.lock. */
+   struct util_dynarray xfb_gs;
+
+   /* Bifrost (v6/v7) has no NULL descriptor. With nullDescriptor enabled, a null write copies one
+    * of these instead: a texture reading zeros (an internal 1x1 image with a ZERO swizzle), and a
+    * storage image and texel buffer whose attribute buffer is 0 bytes, so loads return zeros and
+    * stores are dropped by the bounds check. zero_addr is 4 KB of zeroes nothing writes, what null
+    * vertex buffers, UBOs and SSBOs point at. */
+   struct {
+      bool valid;
+      uint32_t tex[8], img[8], texel[8];
+      uint64_t zero_addr;
+      VkImage image;
+      VkDeviceMemory image_mem;
+      VkImageView view;
+      VkBuffer buffer;
+      VkDeviceMemory buffer_mem;
+   } null_descs;
 
    struct {
       struct panvk_priv_bo *handlers_bo;
@@ -77,10 +115,15 @@ struct panvk_device {
 
    struct vk_meta_device meta;
 
+   /* BC4-BC7 emulation's lookup buffer, made on first use (panvk_bc_emu.h). */
+   struct panvk_bc_emu_state bc_emu;
+
    struct {
       struct panvk_pool rw;
       struct panvk_pool rw_nc;
       struct panvk_pool exec;
+      /* Sync objects command streams wait on (PAN_KMOD_BO_FLAG_KBASE_SYNC on kbase). */
+      struct panvk_pool sync;
    } mempools;
 
    struct {

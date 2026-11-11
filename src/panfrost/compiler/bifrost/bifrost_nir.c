@@ -879,7 +879,8 @@ bifrost_postprocess_nir(nir_shader *nir,
       NIR_PASS(_, nir, pan_nir_lower_fs_outputs, skip_atest,
                inputs->fragcolor_nr_cbufs);
    } else if (nir->info.stage == MESA_SHADER_VERTEX) {
-      NIR_PASS(_, nir, nir_lower_viewport_transform);
+      if (!inputs->vs_keep_clip_space)
+         NIR_PASS(_, nir, nir_lower_viewport_transform);
       NIR_PASS(_, nir, nir_lower_point_size, 1.0, 0.0);
 
       /* Copy varying format & Layout */
@@ -896,8 +897,10 @@ bifrost_postprocess_nir(nir_shader *nir,
          NIR_PASS(_, nir, bifrost_nir_lower_vs_atomics);
 
       /* Needs to run after lower_vs_atomics as it inserts operations between
-       * ssbo_atomic and store_output */
-      NIR_PASS(_, nir, pan_nir_lower_noperspective_vs);
+       * ssbo_atomic and store_output. Only for the stage that feeds the tiler: a
+       * geometry stage reads these varyings as they were written. */
+      if (!inputs->vs_keep_clip_space)
+         NIR_PASS(_, nir, pan_nir_lower_noperspective_vs);
       NIR_PASS(_, nir, pan_nir_lower_vs_inputs);
       NIR_PASS(_, nir, pan_nir_lower_vs_outputs, gpu_arch,
                inputs->varying_layout, info->vs.idvs,

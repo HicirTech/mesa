@@ -94,8 +94,9 @@ struct panvk_rendering_state {
       /* nr_samples to be used before framebuffer / tiler descriptor are emitted */
       uint32_t nr_samples;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10
       uint32_t bo_count;
+
       struct pan_kmod_bo *bos[(MAX_RTS * PANVK_MAX_PLANES) + 2];
       bool needs_load;
       bool needs_store;
@@ -145,6 +146,8 @@ enum panvk_cmd_graphics_dirty_state {
    PANVK_CMD_GRAPHICS_DIRTY_VS_PUSH_UNIFORMS,
    PANVK_CMD_GRAPHICS_DIRTY_FS_PUSH_UNIFORMS,
    PANVK_CMD_GRAPHICS_DIRTY_IDVS,
+   PANVK_CMD_GRAPHICS_DIRTY_GS,
+   PANVK_CMD_GRAPHICS_DIRTY_GS_PUSH_UNIFORMS,
    PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT,
 };
 
@@ -159,6 +162,17 @@ struct panvk_cmd_graphics_state {
    struct panvk_occlusion_query_state occlusion_query;
 #if PAN_ARCH >= 10
    struct panvk_prims_generated_query_state prims_generated_query;
+
+   /* Last values moved into the vertex/tiler CS's IDVS staging registers,
+    * per register, where the matching bit of idvs_sr_valid is set. The CS
+    * register file survives between draws, so a draw only moves what
+    * changed (a 2000-draw frame was 7 of every 10 instructions redundant).
+    * Zeroed with the rest of the state at begin and after
+    * CmdExecuteCommands; anything that writes these registers some other
+    * way clears idvs_sr_valid.
+    */
+   uint64_t idvs_sr_valid;
+   uint32_t idvs_sr[64];
 #endif
    struct panvk_graphics_sysvals sysvals;
 
@@ -170,6 +184,8 @@ struct panvk_cmd_graphics_state {
       const struct panvk_shader *shader;
       struct panvk_shader_desc_state desc;
       uint64_t blend_descs[MAX_RTS];
+      /* blend_descs changed since cmd_prepare_draw_sysvals last copied them. */
+      bool blend_descs_dirty;
       uint64_t push_uniforms;
       bool required;
 #if PAN_ARCH < 9
@@ -182,6 +198,79 @@ struct panvk_cmd_graphics_state {
       bool restart;
    } idvs;
 
+   /* Geometry shaders are emulated by a compute job between the vertex and tiler jobs; see
+    * panvk_nir_lower_gs.c. The buffers are the ones that job writes and the tiler then reads. */
+   struct {
+      /* The geometry shader that runs; app_shader is the one bound (see panvk_select_gs). */
+      const struct panvk_shader *shader;
+      const struct panvk_shader *app_shader;
+      /* CSF: set while the rasterization pass of a geometry shader draw is recorded, and then
+       * the vertex shader of that draw (see csf/panvk_vX_cmd_draw.c, gs_draw). */
+      const struct panvk_shader_variant *rast;
+      struct panvk_shader_desc_state desc;
+      uint64_t push_uniforms;
+      uint64_t out_pos;
+      uint64_t out_general;
+      uint64_t out_index;
+      uint64_t in_general;
+      uint32_t in_general_stride;
+      uint64_t in_offsets;
+      uint64_t out_offsets;
+      uint32_t out_general_stride;
+      uint32_t out_vertex_count;
+      uint32_t out_index_count;
+      enum mesa_prim out_prim;
+      /* PANVK_GS_CPUFILL: the tiler's input was authored by the CPU, so the emulation job is
+       * not run and culling is off. A bisect, not a feature. */
+      bool cpufill;
+      /* PANVK_GS_CPUFILL=2: as above, but ONLY DRAW.position is redirected -- index buffer,
+       * draw mode, instance fields and invocation stay exactly as the working path emits them.
+       * Isolates "the tiler will not read positions from here" from everything else. */
+      bool posonly;
+      /* PANVK_GS_CPUFILL=3: CPU-fill the buffers AND still run the emulation job. If the job's
+       * stores land they overwrite the CPU triangle with the passthrough one, so the two are
+       * told apart by pixel count alone -- no instrumentation inside the shader. */
+      bool keepjob;
+      /* PANVK_GS_INFROMCPU: in_pos points at a CPU-written triangle instead of the vertex
+       * shader's varying buffer. Separates "a global load in this job cannot read memory" from
+       * "it cannot read what the VERTEX JOB just wrote". */
+      uint64_t in_pos_override;
+      /* Transform feedback: the counts and staging records the emulation fills when the draw is
+       * capturing (see panvk_gs_push). */
+      uint64_t xfb_counts;
+      uint64_t xfb_staging;
+      uint32_t xfb_invocations;
+      /* geometryStreams, see panvk_gs_push::xfb_stream_*. */
+      uint64_t xfb_stream_index;
+      uint32_t xfb_stream_slots;
+      uint32_t xfb_stream_idx;
+      /* gl_ViewportIndex: the per-viewport transform table (panvk_gs_push::viewports). */
+      uint64_t viewports;
+   } gs;
+
+   /* Tessellation. The tess eval shader runs through the geometry shader emulation
+    * (panvk_select_gs); the tess control shader and the tessellator are compute jobs in front of
+    * it (emit_tess_jobs). */
+   struct {
+      const struct panvk_shader *tcs;
+      const struct panvk_shader *tes;
+   } tess;
+
+   /* VK_EXT_transform_feedback, captured from the geometry shader emulation. The write offsets
+    * live in GPU memory because they advance on the GPU, draw by draw: each capturing draw reads
+    * `offsets` and leaves a fresh slot behind for the next. last_job orders the capture jobs of
+    * the current batch; closing the batch resets it. */
+   struct {
+      uint64_t addr[4];
+      uint32_t size[4];
+      bool active;
+      uint64_t offsets;
+      unsigned last_job;
+      /* VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT, per stream: a uint64_t[2] (primitives
+       * written, needed) that panlib_xfb_scan adds every draw to, 0 when no query is active. */
+      uint64_t query_stats[4];
+   } xfb;
+
    struct {
       const struct panvk_shader *shader;
       struct panvk_shader_desc_state desc;
@@ -191,6 +280,10 @@ struct panvk_cmd_graphics_state {
       uint64_t attrib_bufs;
       uint64_t indirect_attribs_infos;
       uint64_t indirect_attrib_bufs_infos;
+      /* attribs and attrib_bufs were emitted for a direct, non-instanced draw with no vertex
+       * images: the next such draw reuses them while the vertex input state is unchanged. */
+      bool attribs_reusable;
+      uint32_t attribs_base_instance;
 #else
       /* The number of times desc is repeated.  Zero means that it is not
        * repeated but also that it's re-usable across draws and we're not
@@ -217,6 +310,9 @@ struct panvk_cmd_graphics_state {
       uint64_t dev_addr;
       uint64_t size;
       uint8_t index_size;
+      /* The indices can be read on the CPU at record time: the buffer's GPU address is also its
+       * CPU address (kbase SAME_VA), and its usage lets nothing but the CPU write it. */
+      bool cpu_readable;
    } ib;
 
    struct {
@@ -234,6 +330,8 @@ struct panvk_cmd_graphics_state {
 #if PAN_ARCH >= 10
    uint64_t tsd;
 #endif
+
+   struct panvk_pipeline_stats_state stats;
 
    BITSET_DECLARE(dirty, PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT);
 };
@@ -291,6 +389,86 @@ panvk_depth_range(const struct panvk_cmd_graphics_state *state,
    *z_min = MIN2(a, b);
    *z_max = MAX2(a, b);
 }
+
+#if PAN_ARCH >= 9
+/* A geometry shader writing gl_ViewportIndex can put a primitive in any viewport: the tiler's one
+ * box is then the union of them all, with the union of their depth ranges, and the fragment
+ * shader keeps each primitive inside its own (panvk_nir_lower_viewport_scissor_fs). */
+static inline bool
+panvk_multi_viewport(const struct panvk_cmd_graphics_state *state,
+                     const struct vk_viewport_state *vp)
+{
+   return vp->viewport_count > 1 && state->gs.app_shader &&
+          panvk_shader_only_variant(state->gs.app_shader)->gs.writes_viewport;
+}
+
+/* The box of viewport 0, clipped by its scissor when `scissored`, or the union of every
+ * viewport's (see panvk_multi_viewport). Max is exclusive. */
+static inline void
+panvk_viewport_box(const struct panvk_cmd_graphics_state *state,
+                   const struct vk_viewport_state *vp, bool scissored, int *minx, int *miny,
+                   int *maxx, int *maxy)
+{
+   const unsigned count = panvk_multi_viewport(state, vp) ? vp->viewport_count : 1;
+
+   *minx = *miny = INT_MAX;
+   *maxx = *maxy = INT_MIN;
+   for (unsigned i = 0; i < count; i++) {
+      const VkViewport *viewport = &vp->viewports[i];
+      const VkRect2D *scissor = &vp->scissors[i];
+      int x0 = (int)viewport->x;
+      int x1 = (int)(viewport->x + viewport->width);
+      int y0 = MIN2((int)viewport->y, (int)(viewport->y + viewport->height));
+      int y1 = MAX2((int)viewport->y, (int)(viewport->y + viewport->height));
+
+      if (scissored) {
+         x0 = MAX2(scissor->offset.x, x0);
+         y0 = MAX2(scissor->offset.y, y0);
+         x1 = MIN2(scissor->offset.x + (int)scissor->extent.width, x1);
+         y1 = MIN2(scissor->offset.y + (int)scissor->extent.height, y1);
+      }
+
+      *minx = MIN2(*minx, x0);
+      *miny = MIN2(*miny, y0);
+      *maxx = MAX2(*maxx, x1);
+      *maxy = MAX2(*maxy, y1);
+   }
+}
+
+/* The union of the scissors, for the hardware that clips the viewport and scissor apart. */
+static inline void
+panvk_scissor_box(const struct panvk_cmd_graphics_state *state,
+                  const struct vk_viewport_state *vp, int *minx, int *miny, int *maxx, int *maxy)
+{
+   const unsigned count = panvk_multi_viewport(state, vp) ? vp->viewport_count : 1;
+
+   *minx = *miny = INT_MAX;
+   *maxx = *maxy = INT_MIN;
+   for (unsigned i = 0; i < count; i++) {
+      const VkRect2D *scissor = &vp->scissors[i];
+      *minx = MIN2(*minx, scissor->offset.x);
+      *miny = MIN2(*miny, scissor->offset.y);
+      *maxx = MAX2(*maxx, scissor->offset.x + (int)scissor->extent.width);
+      *maxy = MAX2(*maxy, scissor->offset.y + (int)scissor->extent.height);
+   }
+}
+
+/* panvk_depth_range() over every viewport a geometry shader can name. */
+static inline void
+panvk_depth_range_all(const struct panvk_cmd_graphics_state *state,
+                      const struct vk_viewport_state *vp, float *z_min, float *z_max)
+{
+   panvk_depth_range(state, vp, z_min, z_max);
+   if (vp->depth_clamp_mode == VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT ||
+       !panvk_multi_viewport(state, vp))
+      return;
+
+   for (unsigned i = 1; i < vp->viewport_count; i++) {
+      *z_min = MIN2(*z_min, MIN2(vp->viewports[i].minDepth, vp->viewports[i].maxDepth));
+      *z_max = MAX2(*z_max, MAX2(vp->viewports[i].minDepth, vp->viewports[i].maxDepth));
+   }
+}
+#endif
 
 static inline uint32_t
 panvk_select_tiler_hierarchy_mask(const struct panvk_physical_device *phys_dev,
@@ -460,6 +638,40 @@ struct panvk_draw_info {
 
 #define panvk_get_client_prim(__cmdbuf) vk_topology_to_mesa(                   \
       (__cmdbuf)->vk.dynamic_graphics_state.ia.primitive_topology)
+
+/* Adds a direct draw to an active pipeline statistics query (see panvk_pipeline_stats_state). */
+static inline void
+panvk_stats_add_draw(struct panvk_cmd_graphics_state *gfx,
+                     const struct vk_dynamic_graphics_state *dyn,
+                     const struct panvk_draw_info *info)
+{
+   if (!gfx->stats.active)
+      return;
+
+   uint64_t *c = gfx->stats.counts;
+   const uint64_t inst = info->instance.count;
+   const uint64_t verts = (uint64_t)info->vertex.count * inst;
+   uint64_t prims;
+
+   if (info->prim == MESA_PRIM_PATCHES)
+      prims = info->vertex.count / MAX2(dyn->ts.patch_control_points, 1) * inst;
+   else
+      prims = u_decomposed_prims_for_vertices(info->prim, info->vertex.count) * inst;
+
+   c[0] += verts;
+   c[1] += prims;
+   c[2] += verts;
+   if (gfx->tess.tes) {
+      c[8] += prims;
+      c[9] += prims * MAX2(dyn->ts.patch_control_points, 1);
+   }
+   if (gfx->gs.app_shader) {
+      c[3] += prims;
+      c[4] += prims;
+   }
+   c[5] += prims;
+   c[6] += prims;
+}
 
 void
 panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,

@@ -25,6 +25,7 @@
 #include "drm-uapi/panthor_drm.h"
 
 #include "pan_kmod_backend.h"
+#include "kbase_kmod.h"
 #include "pan_props.h"
 
 /* Maximum kmod BO label length, including NUL-terminator */
@@ -1418,6 +1419,10 @@ panthor_kmod_vm_sync_unlock(struct pan_kmod_vm *vm, uint64_t new_sync_point)
 uint32_t
 panthor_kmod_get_flush_id(const struct pan_kmod_dev *dev)
 {
+   /* kbase: no LATEST_FLUSH page is mapped, and flush ID 0 always flushes. */
+   if (pan_kmod_dev_is_kbase(dev))
+      return 0;
+
    struct panthor_kmod_dev *panthor_dev =
       container_of(dev, struct panthor_kmod_dev, base);
 
@@ -1427,6 +1432,9 @@ panthor_kmod_get_flush_id(const struct pan_kmod_dev *dev)
 const struct drm_panthor_csif_info *
 panthor_kmod_get_csif_props(const struct pan_kmod_dev *dev)
 {
+   if (pan_kmod_dev_is_kbase(dev))
+      return pan_kmod_kbase_csif_props(dev);
+
    struct panthor_kmod_dev *panthor_dev =
       container_of(dev, struct panthor_kmod_dev, base);
 

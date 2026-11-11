@@ -24,6 +24,8 @@
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
 
+#include "panvk_gs.h"
+
 #include "vk_drm_syncobj.h"
 #include "vk_framebuffer.h"
 
@@ -31,18 +33,19 @@
 
 #include "drm-uapi/panfrost_drm.h"
 
-static void
-panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
-                         struct panvk_cmd_buffer *cmdbuf,
-                         struct panvk_batch *batch, uint32_t *bos,
-                         unsigned nr_bos, uint32_t *in_fences,
-                         unsigned nr_in_fences)
-{
-   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   struct panvk_physical_device *phys_dev =
-      to_panvk_physical_device(dev->vk.physical);
-   ASSERTED int ret;
+#include "kmod/kbase_kmod.h"
+#include "panvk_bc_emu.h"
+#include "util/u_sync_provider.h"
 
+static void panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
+                                        struct panvk_batch *batch);
+
+/* What every batch needs before it is (re)submitted: a batch issued before is reset, and the
+ * command buffer's descriptors are made GPU-visible. */
+static void
+panvk_queue_prepare_batch(struct panvk_device *dev, struct panvk_cmd_buffer *cmdbuf,
+                          struct panvk_batch *batch)
+{
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
       util_dynarray_foreach(&batch->jobs, void *, job)
@@ -67,6 +70,324 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    /* Flush pending synchronization requests before submitting the job, to
     * make sure things are GPU-visible. */
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+}
+
+/* A submission that did not complete: say which job stopped it. The job manager writes each
+ * job header's exception status (word 0) and fault pointer (words 2-3) back when the job ends,
+ * and leaves 0 in the ones it never ran -- that is how the TLS overrun on the Mali-G52 was found
+ * (the first job after the last DONE one was the spilling kernel). */
+static void
+panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *const *cmdbufs,
+                          unsigned nr_cmdbufs)
+{
+   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+   unsigned b = 0;
+   for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
+      list_for_each_entry(struct panvk_batch, batch, &cmdbufs[j]->batches, node) {
+         unsigned k = 0;
+         util_dynarray_foreach(&batch->jobs, void *, job) {
+            const uint32_t *w = *job;
+            mesa_loge("panvk: batch %u job %u: status 0x%x type %u index %u deps %u,%u "
+                      "fault 0x%" PRIx64, b, k, w[0], (w[4] >> 1) & 0x7f, w[4] >> 16,
+                      w[5] & 0xffff, w[5] >> 16, (uint64_t)w[2] | ((uint64_t)w[3] << 32));
+            k++;
+         }
+         b++;
+      }
+   }
+}
+
+/* What a kbase submission still has to do once the GPU is done with it. */
+struct panvk_kbase_done {
+   struct panvk_gpu_queue *queue;
+   uint32_t nr_cmdbufs, nr_signals;
+   struct panvk_cmd_buffer **cmdbufs;
+   uint32_t *signals;
+};
+
+/* On the kmod's event thread, when every atom of the submission has reported. The command
+ * buffers cannot have been reset or freed yet: they are pending until the signals below. */
+static void
+panvk_kbase_submit_done(void *data, bool ok)
+{
+   struct panvk_kbase_done *d = data;
+   struct panvk_device *dev = to_panvk_device(d->queue->vk.base.device);
+
+   if (!ok) {
+      mesa_loge("panvk: the kbase submission did not complete");
+      panvk_kbase_report_faults(dev, d->cmdbufs, d->nr_cmdbufs);
+   }
+
+   for (uint32_t j = 0; j < d->nr_cmdbufs; ++j) {
+      list_for_each_entry(struct panvk_batch, batch, &d->cmdbufs[j]->batches, node)
+         panvk_signal_event_syncobjs(d->queue, batch);
+   }
+
+   if (d->nr_signals)
+      dev->vk.sync->signal(dev->vk.sync, d->signals, d->nr_signals);
+
+   free(d);
+}
+
+/*
+ * kbase: every batch of a vkQueueSubmit in one JOB_SUBMIT, each atom waiting on the one before
+ * it, and no wait at all. Submitted and waited for batch by batch, a Minecraft frame (about 30
+ * render passes, copies and clears) paid a full CPU round trip per batch while the GPU sat idle
+ * between them; waited for as a whole, the app still could not record the next frame while the
+ * GPU drew this one. Now the signals are marked submitted, the atoms go to the kernel, and the
+ * kmod's event thread signals them when the work is done. A fence-trigger atom gives the signals
+ * a sync file, which is what the compositor gets for a present.
+ */
+static void
+panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_submit *submit)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   /* Linear images of emulated BC formats first, from what the host may have written into them
+    * since (panvk_bc_emu.h). Held until the submission has its sequence number. */
+   struct panvk_cmd_buffer *refresh =
+      submit->command_buffer_count ? panvk_per_arch(bc_emu_refresh_begin)(dev) : NULL;
+   const uint32_t nr_cmdbufs = submit->command_buffer_count + (refresh ? 1 : 0);
+   const uint32_t nr_signals = submit->signal_count;
+
+   struct panvk_kbase_done *d =
+      malloc(sizeof(*d) + nr_cmdbufs * sizeof(struct panvk_cmd_buffer *) +
+             nr_signals * sizeof(uint32_t));
+   if (!d) {
+      if (refresh)
+         panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, 0);
+      vk_device_set_lost(&dev->vk, "out of memory submitting");
+      return;
+   }
+   d->queue = queue;
+   d->nr_cmdbufs = nr_cmdbufs;
+   d->nr_signals = nr_signals;
+   d->cmdbufs = (struct panvk_cmd_buffer **)(d + 1);
+   d->signals = (uint32_t *)(d->cmdbufs + nr_cmdbufs);
+
+   /* Kept here too: d belongs to the event thread once submitted. */
+   uint32_t signals[MAX2(nr_signals, 1)];
+   for (uint32_t i = 0; i < nr_signals; i++) {
+      assert(vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type));
+      signals[i] = d->signals[i] = vk_sync_as_drm_syncobj(submit->signals[i].sync)->syncobj;
+   }
+
+   for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
+      d->cmdbufs[j] = refresh && j == 0 ? refresh
+                      : container_of(submit->command_buffers[j - (refresh ? 1 : 0)],
+                                     struct panvk_cmd_buffer, vk);
+      /* Its batches are reset below if they ran before, which must not happen under a GPU still
+       * running the previous submission of it (simultaneous use). */
+      if (d->cmdbufs[j]->kbase_seq)
+         pan_kmod_kbase_wait_seq(dev->kmod.dev, d->cmdbufs[j]->kbase_seq);
+   }
+
+   /* A wait the GPU has to keep (the CPU waited only for it to be submitted, see
+    * gpu_queue_submit): it covers the fragment atoms unless its second scope is fragment-only. */
+   for (uint32_t i = 0; i < submit->wait_count; i++) {
+      if (submit->waits[i].stage_mask & ~PANVK_FRAG_ONLY_STAGES)
+         queue->kbase_frag_wait = true;
+   }
+
+   struct pan_kmod_kbase_atom atoms[PAN_KMOD_KBASE_MAX_ATOMS];
+   unsigned nr_atoms = 0;
+
+   for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
+      struct panvk_cmd_buffer *cmdbuf = d->cmdbufs[j];
+
+      list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
+         panvk_queue_prepare_batch(dev, cmdbuf, batch);
+
+         /* More than one submission takes: send what there is, the rest runs after it. */
+         if (nr_atoms + 2 > PAN_KMOD_KBASE_MAX_ATOMS) {
+            if (!pan_kmod_kbase_submit_async(dev->kmod.dev, atoms, nr_atoms, NULL, NULL, NULL))
+               mesa_loge("panvk: the kbase submission was refused");
+            nr_atoms = 0;
+         }
+
+         /* The vertex/tiler atom waits for the one before it and for the last fragment atom
+          * that read its tiler heap, so it runs while the previous batch's fragment atom still
+          * does. It waits for all fragment work when something needs that, and so does one
+          * without a tiler heap (compute, copies, query and event batches): nothing records
+          * what those read. Fragment atoms run in order. */
+         const bool has_heap = batch->tiler.heap_desc.gpu != 0;
+         const uint8_t heap = has_heap ? PAN_KMOD_KBASE_TRACK_HEAP0 << batch->tiler_heap : 0;
+         if (batch->order & PANVK_BATCH_WAIT_FRAG)
+            queue->kbase_frag_wait = true;
+
+         uint8_t vtc = 0;
+         if (batch->vtc_jc.first_job) {
+            const bool all_frags = queue->kbase_frag_wait || !has_heap;
+            uint8_t wait = PAN_KMOD_KBASE_TRACK_VTC |
+                           (all_frags ? PAN_KMOD_KBASE_TRACK_FRAG : heap);
+            uint8_t join = PAN_KMOD_KBASE_TRACK_VTC | heap;
+            const bool frag_ordered = batch->order & PANVK_BATCH_FRAG_ORDERED;
+            /* Only WRITE_VALUE jobs (a timestamp): on the fragment slot when it runs them,
+             * otherwise it queues on the vertex/tiler slot behind the next batch's geometry,
+             * which holds the fragment atoms waiting for it (G72: -8% to -24% fps). */
+            const bool frag_slot = frag_ordered && !batch->frag_jc.first_job &&
+                                   batch->vtc_jc.job_index == batch->nr_write_jobs &&
+                                   pan_kmod_kbase_frag_slot_writes(dev->kmod.dev);
+            if (frag_ordered) {
+               wait = PAN_KMOD_KBASE_TRACK_VTC | PAN_KMOD_KBASE_TRACK_FRAG;
+               join = PAN_KMOD_KBASE_TRACK_FRAG;
+            }
+            atoms[nr_atoms] = (struct pan_kmod_kbase_atom){
+               .jc = batch->vtc_jc.first_job,
+               .core_req = (frag_slot ? KBASE_JD_REQ_FRAGMENT : KBASE_JD_REQ_VERTEX_TILER) |
+                           (batch->needs_permon ? KBASE_JD_REQ_PERMON : 0),
+               .atom_number = nr_atoms + 1,
+               .wait = wait,
+               .join = join,
+            };
+            vtc = ++nr_atoms;
+            if (!frag_ordered)
+               queue->kbase_frag_wait = false;
+         }
+
+         if (batch->frag_jc.first_job) {
+            /* Without a vertex/tiler atom it waits for the newest one directly. */
+            atoms[nr_atoms] = (struct pan_kmod_kbase_atom){
+               .jc = batch->frag_jc.first_job,
+               .core_req = KBASE_JD_REQ_FRAGMENT,
+               .atom_number = nr_atoms + 1,
+               .dep_atom = vtc,
+               .wait = PAN_KMOD_KBASE_TRACK_FRAG | (vtc ? 0 : PAN_KMOD_KBASE_TRACK_VTC),
+               .join = PAN_KMOD_KBASE_TRACK_FRAG | heap,
+            };
+            ++nr_atoms;
+         }
+
+         if (batch->order & PANVK_BATCH_HOLD_FRAG)
+            queue->kbase_frag_wait = true;
+
+         batch->issued = true;
+      }
+
+      /* A barrier at the end of the command buffer reaches into the next one. */
+      if (cmdbuf->pending_frag_wait)
+         queue->kbase_frag_wait = true;
+   }
+
+   /* Before submitting: the completion may run before submit_async even returns. */
+   pan_kmod_kbase_sync_submitted(signals, nr_signals);
+
+   int fence = -1;
+   const uint64_t seq = pan_kmod_kbase_submit_async(
+      dev->kmod.dev, atoms, nr_atoms, nr_signals ? &fence : NULL, panvk_kbase_submit_done, d);
+   if (refresh)
+      panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, seq);
+   if (!seq) {
+      /* Signal anyway, so nothing waits forever on work that was never sent. */
+      panvk_kbase_submit_done(d, false);
+      return;
+   }
+
+   pan_kmod_kbase_sync_attach_fd(signals, nr_signals, fence);
+   if (fence >= 0)
+      close(fence);
+
+   for (uint32_t j = 0; j < submit->command_buffer_count; ++j)
+      container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk)->kbase_seq = seq;
+
+}
+
+static void
+panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+                         struct panvk_cmd_buffer *cmdbuf,
+                         struct panvk_batch *batch, uint32_t *bos,
+                         unsigned nr_bos, uint32_t *in_fences,
+                         unsigned nr_in_fences)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+   ASSERTED int ret;
+
+   panvk_queue_prepare_batch(dev, cmdbuf, batch);
+
+   /* kbase takes the whole frame in one submission: a vertex/tiler atom and a fragment atom that
+    * depends on it, which is the shape the vendor driver was captured producing for a triangle.
+    * There is no fence to hand back, so pan_kmod_kbase_submit blocks until both atoms report.
+    *
+    * This branch is not an optimisation. On this kernel DRM_IOCTL_PANFROST_SUBMIT returns
+    * SUCCESS and does nothing, so without it every submit below silently no-ops and the driver
+    * looks like it works right up until someone reads a pixel back. */
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      struct pan_kmod_kbase_atom atoms[2];
+      unsigned nr_atoms = 0;
+
+      if (batch->vtc_jc.first_job) {
+         atoms[nr_atoms++] = (struct pan_kmod_kbase_atom){
+            .jc = batch->vtc_jc.first_job,
+            .core_req = KBASE_JD_REQ_VERTEX_TILER |
+                        (batch->needs_permon ? KBASE_JD_REQ_PERMON : 0),
+            .atom_number = 1,
+         };
+      }
+
+      if (batch->frag_jc.first_job) {
+         atoms[nr_atoms++] = (struct pan_kmod_kbase_atom){
+            .jc = batch->frag_jc.first_job,
+            .core_req = KBASE_JD_REQ_FRAGMENT,
+            .atom_number = 2,
+            .dep_atom = batch->vtc_jc.first_job ? 1 : 0,
+         };
+      }
+
+      if (nr_atoms && getenv("PANVK_GS_DUMP") && panvk_gs_dbg_pos_cpu) {
+         /* kbase_submit below blocks until every atom has reported, so this is the first moment
+          * the emulation's output buffer can be read back honestly. */
+         const float *p = panvk_gs_dbg_pos_cpu;
+         pan_kmod_kbase_submit(dev->kmod.dev, atoms, nr_atoms);
+         fprintf(stderr, "[GSDUMP] out_pos cpu=%p gpu=0x%" PRIx64 " verts=%u\n",
+                 panvk_gs_dbg_pos_cpu, panvk_gs_dbg_pos_gpu, panvk_gs_dbg_pos_verts);
+         for (uint32_t v = 0; v < panvk_gs_dbg_pos_verts && v < 8; v++)
+            fprintf(stderr,
+                    "[GSDUMP]   v%u = %f %f %f %f   raw %08x %08x %08x %08x\n",
+                    v, p[v * 4 + 0], p[v * 4 + 1], p[v * 4 + 2], p[v * 4 + 3],
+                    ((const uint32_t *)p)[v * 4 + 0],
+                    ((const uint32_t *)p)[v * 4 + 1],
+                    ((const uint32_t *)p)[v * 4 + 2],
+                    ((const uint32_t *)p)[v * 4 + 3]);
+         if (panvk_gs_dbg_in_pos_cpu) {
+            const float *ip = panvk_gs_dbg_in_pos_cpu;
+            for (uint32_t v = 0; v < 3; v++)
+               fprintf(stderr, "[GSDUMP]   VS in v%u = %f %f %f %f\n",
+                       v, ip[v * 4 + 0], ip[v * 4 + 1], ip[v * 4 + 2],
+                       ip[v * 4 + 3]);
+         }
+         if (panvk_gs_dbg_idx_cpu) {
+            const uint32_t *ix = panvk_gs_dbg_idx_cpu;
+            fprintf(stderr, "[GSDUMP]   indices(%u) =", panvk_gs_dbg_idx_count);
+            for (uint32_t i = 0; i < panvk_gs_dbg_idx_count && i < 12; i++)
+               fprintf(stderr, " %u", ix[i]);
+            fprintf(stderr, "\n");
+         }
+         panvk_gs_dbg_pos_cpu = NULL;
+      } else if (nr_atoms && !pan_kmod_kbase_submit(dev->kmod.dev, atoms, nr_atoms))
+         mesa_loge("panvk: the kbase submission did not complete");
+
+      /* The GPU is finished by the time we get here, so anything read back on the CPU has to see
+       * what it wrote. */
+      panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
+
+      if (PANVK_DEBUG(TRACE)) {
+         if (batch->vtc_jc.first_job)
+            pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
+                         phys_dev->kmod.dev->props.gpu_id);
+         if (batch->frag_jc.first_job)
+            pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
+                         phys_dev->kmod.dev->props.gpu_id);
+         pandecode_next_frame(dev->debug.decode_ctx);
+      }
+
+      if (PANVK_DEBUG(DUMP))
+         pandecode_dump_mappings(dev->debug.decode_ctx);
+
+      batch->issued = true;
+      return;
+   }
 
    if (batch->vtc_jc.first_job) {
       struct drm_panfrost_submit submit = {
@@ -159,6 +480,14 @@ panvk_queue_transfer_sync(struct panvk_gpu_queue *queue, uint32_t syncobj)
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    ASSERTED int ret;
 
+   /* kbase: the submission already blocked until the GPU was done, so every signal is due
+    * now. (The DRM path below would "succeed" on the Exynos kernel without doing anything, and
+    * fail on a MediaTek one.) */
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      dev->vk.sync->signal(dev->vk.sync, &syncobj, 1);
+      return;
+   }
+
    struct drm_syncobj_handle handle = {
       .handle = queue->sync,
       .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
@@ -212,12 +541,7 @@ panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
       case PANVK_EVENT_OP_RESET: {
          struct panvk_event *event = op->event;
 
-         struct drm_syncobj_array objs = {
-            .handles = (uint64_t)(uintptr_t)&event->syncobj,
-            .count_handles = 1};
-
-         ASSERTED int ret = pan_kmod_ioctl(dev->drm_fd,
-                                  DRM_IOCTL_SYNCOBJ_RESET, &objs);
+         ASSERTED int ret = dev->vk.sync->reset(dev->vk.sync, &event->syncobj, 1);
          assert(!ret);
          break;
       }
@@ -246,6 +570,21 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
          vk_sync_as_drm_syncobj(submit->waits[i].sync);
 
       semaphores[i + 1] = syncobj->syncobj;
+   }
+
+   /* kbase has no GPU-side wait. A wait on an object whose signal is already submitted needs
+    * nothing: every kbase submission runs after the ones before it. Anything else (signaled by
+    * the host, or not submitted yet) is waited for here, on the CPU. */
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev) && submit->wait_count)
+      dev->vk.sync->wait(dev->vk.sync, semaphores + 1, submit->wait_count, INT64_MAX,
+                         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL |
+                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+                         NULL);
+
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev) && !PANVK_DEBUG(TRACE) && !PANVK_DEBUG(DUMP) &&
+       !getenv("PANVK_GS_DUMP")) {
+      panvk_queue_submit_kbase_chain(queue, submit);
+      return vk_device_check_status(&dev->vk);
    }
 
    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
@@ -282,7 +621,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
             bos[bo_idx++] = pan_kmod_bo_handle(batch->blit.dst);
 
          if (batch->vtc_jc.first_tiler)
-            bos[bo_idx++] = pan_kmod_bo_handle(dev->tiler_heap->bo);
+            bos[bo_idx++] = pan_kmod_bo_handle(dev->tiler_heap[batch->tiler_heap]->bo);
 
          bos[bo_idx++] = pan_kmod_bo_handle(dev->sample_positions->bo);
          assert(bo_idx == nr_bos);
@@ -375,6 +714,8 @@ void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev))
+      pan_kmod_kbase_wait_seq(dev->kmod.dev, 0);
    vk_queue_finish(&queue->vk);
    pan_kmod_sync_destroy(dev->kmod.dev, queue->sync);
    vk_free(&dev->vk.alloc, queue);
@@ -399,6 +740,12 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
       /* Check printf buffer one more time before exiting */
       u_printf_with_ctx(stdout, &dev->printf.ctx);
       return VK_ERROR_DEVICE_LOST;
+   }
+
+   /* kbase: everything submitted so far has completed and signaled. */
+   if (pan_kmod_dev_is_kbase(dev->kmod.dev)) {
+      pan_kmod_kbase_wait_seq(dev->kmod.dev, 0);
+      return vk_device_check_status(&dev->vk);
    }
 
    ASSERTED int ret = pan_kmod_sync_wait(dev->kmod.dev, &queue->sync, 1,

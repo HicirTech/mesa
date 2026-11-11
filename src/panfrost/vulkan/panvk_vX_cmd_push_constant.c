@@ -95,6 +95,18 @@ panvk_per_arch(cmd_prepare_compute_push_uniforms)(
                                 (uint64_t *)&cmdbuf->state.compute.sysvals);
 }
 
+VkResult
+panvk_per_arch(cmd_prepare_gs_push_uniforms)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
+   const struct panvk_compute_sysvals *sysvals, struct pan_ptr *push_uniforms)
+{
+   /* A lowered geometry shader runs as compute during a GRAPHICS draw, so its sysvals cannot come
+    * from state.compute -- that belongs to vkCmdDispatch and would be clobbered. The caller
+    * builds them on the stack instead. */
+   return prepare_push_uniforms(cmdbuf, shader, push_uniforms, 1,
+                                (uint64_t *)sysvals);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdPushConstants2KHR)(
    VkCommandBuffer commandBuffer,
@@ -116,3 +128,23 @@ panvk_per_arch(CmdPushConstants2KHR)(
 
    memcpy(data, pPushConstantsInfo->pValues, pPushConstantsInfo->size);
 }
+
+#if PAN_ARCH >= 9
+/* VK_EXT_descriptor_heap push data lives in the push constant space and is
+ * visible to every stage. */
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdPushDataEXT)(VkCommandBuffer commandBuffer,
+                               const VkPushDataInfoEXT *pPushDataInfo)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+   gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
+   compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
+
+   assert(pPushDataInfo->offset + pPushDataInfo->data.size <=
+          MAX_PUSH_CONSTANTS_SIZE);
+   memcpy((uint8_t *)cmdbuf->state.push_constants.data + pPushDataInfo->offset,
+          pPushDataInfo->data.address, pPushDataInfo->data.size);
+}
+#endif

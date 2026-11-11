@@ -365,6 +365,11 @@ fill_textures(struct panvk_cmd_buffer *cmdbuf,
       }
 
       struct pan_image_view pview = *iview;
+      /* A cube view bound as a layered attachment is loaded face by face, as array layers. A
+       * cube descriptor counts cubes, so faces 1-5 of one cube were out of bounds and loaded
+       * as zero (G76 and G720; the vendor driver keeps them). */
+      if (pview.dim == MALI_TEXTURE_DIMENSION_CUBE)
+         pview.dim = MALI_TEXTURE_DIMENSION_2D;
       if (loc == FRAG_RESULT_DEPTH)
          pview.format = util_format_get_depth_only(pview.format);
       else if (loc == FRAG_RESULT_STENCIL)
@@ -757,13 +762,21 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf,
       cfg.maximum_z = 1.0;
       cfg.shader.resources = res_table.gpu | res_table_size;
       cfg.shader.shader = panvk_priv_mem_dev_addr(shader->spd);
+#if PAN_ARCH >= 10
       cfg.shader.thread_storage = cmdbuf->state.gfx.tsd;
+#else
+      /* JM: the batch's thread storage, emitted when it closes. */
+      cfg.shader.thread_storage = cmdbuf->cur_batch->tls.gpu;
+#endif
       cfg.shader.fau_count = sizeof(struct panvk_fb_sysvals) / FAU_WORD_SIZE;
       cfg.shader.fau = faus.gpu;
 #endif
+#if PAN_ARCH >= 10
       cfg.flags_2.write_mask = rt_written;
       cfg.flags_2.read_mask = rt_read;
+#endif
 #if PAN_ARCH >= 11
+
       cfg.flags_2.no_shader_depth_read =
          !(locations_read & BITFIELD_BIT(FRAG_RESULT_DEPTH));
       cfg.flags_2.no_shader_stencil_read =

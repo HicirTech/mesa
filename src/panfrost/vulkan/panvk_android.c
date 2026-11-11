@@ -7,12 +7,22 @@
 
 #include "panvk_device.h"
 #include "panvk_image.h"
+#include "panvk_entrypoints.h"
+#include "panvk_physical_device.h"
 
+#include "kmod/kbase_kmod.h"
+
+#include <errno.h>
+#include <poll.h>
+#include <unistd.h>
+
+#include "util/log.h"
 #include "vndk/hardware_buffer.h"
 #include "vulkan/vk_android_native_buffer.h"
 
 #include "vk_alloc.h"
 #include "vk_android.h"
+#include "vk_common_entrypoints.h"
 #include "vk_device_memory.h"
 #include "vk_util.h"
 
@@ -256,9 +266,7 @@ panvk_android_import_ahb_memory(VkDevice device,
                                 VkDeviceMemory *pMemory)
 {
    VK_FROM_HANDLE(vk_device, dev, device);
-   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(ahb);
-   assert(handle && handle->numFds > 0);
-   int dma_buf_fd = handle->data[0];
+   int dma_buf_fd = vk_android_ahb_dma_buf_fd(ahb);
    VkResult result;
 
    VkImage img_handle = VK_NULL_HANDLE;
@@ -390,4 +398,81 @@ panvk_android_allocate_ahb_memory(VkDevice device,
    mem->ahardware_buffer = ahb;
 
    return VK_SUCCESS;
+}
+
+/*
+ * On ARM's own gralloc (the kbase stack: Exynos Mali phones), a GPU render + composer buffer
+ * of screen size comes back AFBC-compressed, in a layout the allocator does not describe
+ * anywhere a driver can read it. MALI_GRALLOC_USAGE_NO_AFBC, gralloc's first private usage bit,
+ * makes it linear instead -- measured, as is CPU read usage, which
+ * would cost more. A DRM-backed device has a different allocator and gets the common usage.
+ *
+ * MediaTek's allocator (Galaxy A31) ignores NO_AFBC: a render + texture buffer, which is what a
+ * TextureView consumer asks for, still comes back AFBC. Asking for composer usage as well makes
+ * it linear there, and Exynos stays linear with it. The same holds for the AHardwareBuffers we
+ * allocate for image memory (android_ahb_image_usage): a GPU-only one comes back AFBC on
+ * MediaTek, and importing it again, as Winlator-style wrappers do for swapchain images, failed.
+ */
+static bool
+panvk_android_is_kbase(VkDevice device)
+{
+   VK_FROM_HANDLE(panvk_device, dev, device);
+   struct panvk_physical_device *phys_dev = to_panvk_physical_device(dev->vk.physical);
+   return pan_kmod_dev_is_kbase(phys_dev->kmod.dev);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_GetSwapchainGrallocUsageANDROID(VkDevice device, VkFormat format,
+                                      VkImageUsageFlags imageUsage, int *grallocUsage)
+{
+   VkResult result =
+      vk_common_GetSwapchainGrallocUsageANDROID(device, format, imageUsage, grallocUsage);
+   if (result == VK_SUCCESS && panvk_android_is_kbase(device))
+      *grallocUsage |= MALI_GRALLOC_USAGE_NO_AFBC | GRALLOC_USAGE_HW_COMPOSER;
+   return result;
+}
+
+#if ANDROID_API_LEVEL >= 26
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_GetSwapchainGrallocUsage2ANDROID(VkDevice device, VkFormat format,
+                                       VkImageUsageFlags imageUsage,
+                                       VkSwapchainImageUsageFlagsANDROID swapchainImageUsage,
+                                       uint64_t *grallocConsumerUsage,
+                                       uint64_t *grallocProducerUsage)
+{
+   VkResult result = vk_common_GetSwapchainGrallocUsage2ANDROID(
+      device, format, imageUsage, swapchainImageUsage, grallocConsumerUsage,
+      grallocProducerUsage);
+   if (result == VK_SUCCESS && panvk_android_is_kbase(device)) {
+      *grallocProducerUsage |= MALI_GRALLOC_USAGE_NO_AFBC;
+      *grallocConsumerUsage |= GRALLOC_USAGE_HW_COMPOSER;
+   }
+   return result;
+}
+#endif
+
+/*
+ * The compositor hands the buffer over with a sync fd that signals once the display is done
+ * reading it. vk_common imports it into the semaphore as a DRM syncobj, and kbase answers the
+ * syncobj ioctls with success without doing anything, so the wait would be dropped and the GPU
+ * could draw into a buffer still on screen. Every kbase submission already blocks until the GPU
+ * is done, so waiting for the fd here, on the CPU, is the whole of the ordering.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_AcquireImageANDROID(VkDevice device, VkImage image, int nativeFenceFd,
+                          VkSemaphore semaphore, VkFence fence)
+{
+   if (nativeFenceFd >= 0 && panvk_android_is_kbase(device)) {
+      struct pollfd pfd = {.fd = nativeFenceFd, .events = POLLIN};
+      int ret;
+      do {
+         ret = poll(&pfd, 1, 5000);
+      } while (ret < 0 && (errno == EINTR || errno == EAGAIN));
+      if (ret <= 0)
+         mesa_logw("panvk: the acquire fence did not signal (poll %d), drawing anyway", ret);
+      close(nativeFenceFd);
+      nativeFenceFd = -1;
+   }
+
+   return vk_common_AcquireImageANDROID(device, image, nativeFenceFd, semaphore, fence);
 }

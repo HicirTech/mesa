@@ -257,9 +257,13 @@ panlib_patch_draw_tiler_dcd(struct panlib_draw_info *draw)
    }
 }
 
-static void
+/* Returns false when the draw's varyings do not fit in what is left of the shared buffer. The
+ * space is taken anyway (the offset is shared), so every later draw of the batch fails too, and
+ * each is dropped rather than written over the varyings of a draw the fragment job still reads. */
+static bool
 panlib_patch_varying_bufs(struct panlib_draw_info *draw)
 {
+   bool fits = true;
    uint32_t vertex_count = draw->padded_vertex_count * draw->instance.count;
 
    for (uint32_t i = 0; i < PANLIB_VARY_BUF_MAX; i++) {
@@ -271,7 +275,14 @@ panlib_patch_varying_bufs(struct panlib_draw_info *draw)
       pan_pack(desc, ATTRIBUTE_BUFFER, cfg) {
          memcpy(&cfg, &unpacked_desc, sizeof(cfg));
          cfg.size = vertex_count * cfg.stride;
-         cfg.pointer = (uint64_t) poly_heap_alloc(draw->heap, cfg.size, 64);
+         /* poly_heap_alloc, except that a draw that does not fit is dropped (fits = false)
+          * instead of aborting the batch. */
+         uint32_t offs = atomic_fetch_add((volatile atomic_uint *)&draw->heap->bottom,
+                                          cfg.size + 64);
+         offs = ALIGN_POT(offs, 64);
+         if (offs + cfg.size > draw->heap->size)
+            fits = false;
+         cfg.pointer = (uint64_t)(draw->heap->base + offs);
 
          if (i == PANLIB_VARY_BUF_POSITION)
             draw->position = cfg.pointer;
@@ -279,6 +290,7 @@ panlib_patch_varying_bufs(struct panlib_draw_info *draw)
             draw->psiz = cfg.pointer;
       }
    }
+   return fits;
 }
 
 static void
@@ -395,6 +407,10 @@ panlib_patch_draw(struct panlib_draw_info *draw)
    /* First of all, we need to ensure each jobs have the proper header */
    bool is_null_job = draw->vertex_range == 0 || draw->instance.count == 0;
 
+   /* The varyings first: a draw they do not fit for is not run at all. */
+   if (!is_null_job && !panlib_patch_varying_bufs(draw))
+      is_null_job = true;
+
    if (draw->idvs_job != NULL) {
       panlib_patch_job_type_header(
          (global struct mali_job_header_packed *)draw->idvs_job,
@@ -411,10 +427,6 @@ panlib_patch_draw(struct panlib_draw_info *draw)
    /* In case there is nothing to draw, let's just bail out. */
    if (is_null_job)
       return;
-
-   /* Next we patch varying buffer descriptors and collect position and point
-    * size varying addresses */
-   panlib_patch_varying_bufs(draw);
 
    /* Patch the vertex draw and invocation descriptors */
    panlib_patch_draw_vertex_dcd(draw);
@@ -630,5 +642,492 @@ panlib_draw_index_minmax_search_helper(global uint8_t *index_buffer_ptr,
 
    atomic_fetch_min(min_ptr, local_min);
    atomic_fetch_max(max_ptr, local_max);
+}
+
+/* The batch-wide helpers. Per draw, the scan and the patch were a chain of four jobs of one or a
+ * few threads each (write the min/max seed, scan with one thread per 1024 indices, patch with one
+ * thread), run back to back before the draw's vertex job: measured on the S10e, 0.38 ms of GPU
+ * time per draw whatever its size, 63 ms for 150 draws the CPU path draws in 4.7. The work is
+ * tiny; the latency of each job and each serial thread was the cost. Here one scan job and one
+ * patch job serve every draw of the batch, with the draws spread over workgroups and the indices
+ * of a draw over threads. */
+
+static void
+panlib_draw_batch_scan_entry(global struct libpan_draw_batch_entry *e, uint32_t tid,
+                             uint32_t stride)
+{
+   if (!e->index_size)
+      return;
+
+   global VkDrawIndexedIndirectCommand *cmd = (global VkDrawIndexedIndirectCommand *)e->cmd;
+   const uint32_t start = cmd->firstIndex;
+   const uint32_t count = cmd->indexCount;
+   const bool restart = e->primitive_restart != 0;
+   uint32_t lo = UINT32_MAX, hi = 0;
+
+   switch (e->index_size) {
+#define BATCH_SCAN_CASE(sz)                                                    \
+   case sz / 8: {                                                              \
+      global uint##sz##_t *ib = (global uint##sz##_t *)e->index_buffer_ptr + start; \
+      for (uint32_t i = tid; i < count; i += stride) {                         \
+         const uint32_t v = ib[i];                                             \
+         if (restart && v == UINT##sz##_MAX)                                   \
+            continue;                                                          \
+         lo = min(lo, v);                                                      \
+         hi = max(hi, v);                                                      \
+      }                                                                        \
+      break;                                                                   \
+   }
+      BATCH_SCAN_CASE(32)
+      BATCH_SCAN_CASE(16)
+      BATCH_SCAN_CASE(8)
+#undef BATCH_SCAN_CASE
+   default:
+      return;
+   }
+
+   if (lo <= hi) {
+      atomic_fetch_min((global atomic_uint *)&e->index_min, lo);
+      atomic_fetch_max((global atomic_uint *)&e->index_max, hi);
+   }
+}
+
+/* The [min, max] index of every indexed draw of the batch. Fewer draws than workgroups: each draw
+ * is split between groups / count of them; more: each workgroup takes every groups-th draw. */
+KERNEL(64)
+panlib_draw_batch_minmax(global struct libpan_draw_batch *batch)
+{
+   global struct libpan_draw_batch_entry *entries =
+      (global struct libpan_draw_batch_entry *)batch->entries;
+   const uint32_t n = batch->count;
+   const uint32_t groups = cl_global_size.x / 64;
+   const uint32_t g = cl_global_id.x / 64;
+   const uint32_t lid = cl_global_id.x % 64;
+
+   if (n == 0)
+      return;
+
+   if (n < groups) {
+      const uint32_t slices = groups / n;
+      if (g / slices < n)
+         panlib_draw_batch_scan_entry(&entries[g / slices], (g % slices) * 64 + lid, slices * 64);
+   } else {
+      for (uint32_t e = g; e < n; e += groups)
+         panlib_draw_batch_scan_entry(&entries[e], lid, 64);
+   }
+}
+
+/* Every draw's descriptors and sysvals, one thread per draw. */
+KERNEL(64)
+panlib_draw_batch_patch(global struct libpan_draw_batch *batch)
+{
+   global struct libpan_draw_batch_entry *entries =
+      (global struct libpan_draw_batch_entry *)batch->entries;
+
+   for (uint32_t i = cl_global_id.x; i < batch->count; i += cl_global_size.x) {
+      global struct libpan_draw_batch_entry *e = &entries[i];
+
+      struct panlib_draw_info draw = {
+         .idvs_job = (global uint8_t *)e->idvs_job,
+         .vertex_job = (global uint8_t *)e->vertex_job,
+         .tiler_job = (global uint8_t *)e->tiler_job,
+
+         .varying_bufs.descs = (global struct mali_attribute_buffer_packed *)e->varying_bufs_descs,
+         .heap = (global struct poly_heap *)e->heap,
+
+         .attrib_bufs.descs = (global struct mali_attribute_buffer_packed *)e->attrib_bufs_descs,
+         .attrib_bufs.infos =
+            (global struct libpan_draw_helper_attrib_buf_info *)e->attrib_bufs_infos,
+         .attrib_bufs.valid = e->attrib_bufs_valid,
+
+         .attribs.descs = (global struct mali_attribute_packed *)e->attribs_descs,
+         .attribs.infos = (global struct libpan_draw_helper_attrib_info *)e->attribs_infos,
+         .attribs.valid = e->attribs_valid,
+
+         .primitive_vertex_count = e->primitive_vertex_count,
+      };
+
+      if (e->index_size) {
+         global VkDrawIndexedIndirectCommand *cmd = (global VkDrawIndexedIndirectCommand *)e->cmd;
+         const uint32_t lo = e->index_min, hi = e->index_max;
+
+         draw.index.size = e->index_size;
+         draw.index.offset = cmd->firstIndex;
+         draw.vertex.base = cmd->vertexOffset;
+         draw.vertex.raw_offset = lo + cmd->vertexOffset;
+         draw.vertex.count = cmd->indexCount;
+         draw.instance.base = cmd->firstInstance;
+         draw.instance.count = cmd->instanceCount;
+         /* No index but restarts: nothing to draw. */
+         draw.vertex_range = cmd->indexCount && lo <= hi ? hi - lo + 1 : 0;
+         draw.indices = (global uint8_t *)e->index_buffer_ptr;
+
+         if (e->index_min_out)
+            *(global uint32_t *)e->index_min_out = lo;
+         e->index_min = UINT32_MAX;
+         e->index_max = 0;
+      } else {
+         global VkDrawIndirectCommand *cmd = (global VkDrawIndirectCommand *)e->cmd;
+
+         draw.vertex.base = cmd->firstVertex;
+         draw.vertex.raw_offset = cmd->firstVertex;
+         draw.vertex.count = cmd->vertexCount;
+         draw.instance.base = cmd->firstInstance;
+         draw.instance.count = cmd->instanceCount;
+         draw.vertex_range = cmd->vertexCount;
+      }
+
+      draw.padded_vertex_count =
+         padded_vertex_count(draw.vertex_range, draw.instance.count, draw.idvs_job != NULL);
+
+      panlib_patch_draw(&draw);
+
+      if (e->first_vertex_sysval)
+         *(global uint32_t *)e->first_vertex_sysval = draw.vertex.base;
+      if (e->first_instance_sysval)
+         *(global uint32_t *)e->first_instance_sysval = draw.instance.base;
+      if (e->raw_vertex_offset_sysval)
+         *(global uint32_t *)e->raw_vertex_offset_sysval = draw.vertex.raw_offset;
+   }
+}
+
+/* Geometry shader + primitive restart. Which vertices input primitive p takes depends on every
+ * restart index before it, so one thread walks the index buffer, splits it into segments at the
+ * restart value, and writes each segment's primitives out as a list of 32-bit indices in the
+ * geometry shader's input order, plus a draw command naming how many there are. The emulation
+ * then reads that as an indexed LIST. Topology numbers are enum panvk_gs_topology. */
+static uint32_t
+panlib_gs_read_index(global uint8_t *ib, uint32_t size, uint32_t i)
+{
+   if (size == 1)
+      return ib[i];
+   if (size == 2)
+      return ((global uint16_t *)ib)[i];
+   return ((global uint32_t *)ib)[i];
+}
+
+static uint32_t
+panlib_gs_seg_prims(uint32_t topology, uint32_t vpp, uint32_t len)
+{
+   if (topology == 1)
+      return len >= vpp ? len - (vpp - 1) : 0;
+   if (topology == 2)
+      return len >= 3 ? len - 2 : 0;
+   if (topology == 3)
+      return len >= 6 ? (len - 4) / 2 : 0;
+   return len / vpp;
+}
+
+/* Position inside the segment of vertex k of primitive p; the same rules as gs_input_record(). */
+static uint32_t
+panlib_gs_seg_vertex(uint32_t topology, uint32_t vpp, uint32_t p, uint32_t k, uint32_t nprims)
+{
+   if (topology == 1) {
+      if (vpp == 3 && (p & 1))
+         return p + (k == 1 ? 2 : k == 2 ? 1 : 0);
+      return p + k;
+   }
+   if (topology == 2)
+      return k == 2 ? 0 : p + k + 1;
+   if (topology == 3) {
+      const uint32_t p2 = p * 2;
+      const uint32_t far = p == nprims - 1 ? p2 + 5 : p2 + 6;
+      if (p & 1)
+         return k == 0 ? p2 + 2 : k == 1 ? p2 - 2 : k == 2 ? p2 : k == 3 ? p2 + 3
+              : k == 4 ? p2 + 4 : far;
+      return k == 0 ? p2 : k == 1 ? (p == 0 ? 1 : p2 - 2) : k == 2 ? p2 + 2 : k == 3 ? far
+           : k == 4 ? p2 + 4 : p2 + 3;
+   }
+   return p * vpp + k;
+}
+
+KERNEL(1)
+panlib_gs_restart_unroll(global VkDrawIndexedIndirectCommand *cmd, global uint8_t *ib,
+                         global uint32_t *out, global VkDrawIndexedIndirectCommand *out_cmd,
+                         uint32_t index_size, uint32_t topology, uint32_t vpp,
+                         uint32_t max_prims)
+{
+   const uint32_t n = cmd->indexCount;
+   global uint8_t *base = ib + (uint64_t)cmd->firstIndex * index_size;
+   const uint32_t restart =
+      index_size == 1 ? 0xffu : index_size == 2 ? 0xffffu : 0xffffffffu;
+
+   uint32_t prims = 0, seg = 0;
+   for (uint32_t i = 0; i <= n && prims < max_prims; i++) {
+      if (i < n && panlib_gs_read_index(base, index_size, i) != restart)
+         continue;
+
+      const uint32_t np = panlib_gs_seg_prims(topology, vpp, i - seg);
+      for (uint32_t p = 0; p < np && prims < max_prims; p++, prims++) {
+         for (uint32_t k = 0; k < vpp; k++)
+            out[prims * vpp + k] = panlib_gs_read_index(
+               base, index_size, seg + panlib_gs_seg_vertex(topology, vpp, p, k, np));
+      }
+      seg = i + 1;
+   }
+
+   out_cmd->indexCount = prims * vpp;
+   out_cmd->instanceCount = cmd->instanceCount;
+   out_cmd->firstIndex = 0;
+   out_cmd->vertexOffset = cmd->vertexOffset;
+   out_cmd->firstInstance = cmd->firstInstance;
+}
+
+#endif
+
+#if PAN_ARCH >= 6
+/* Transform feedback. The geometry shader emulation left, per invocation, how many complete
+ * primitives it emitted and a staging record for every vertex slot. Capture order is draw order,
+ * which is invocation order, so one thread turns the counts into each invocation's first
+ * primitive, fits the draw into the buffers, and advances the write offsets. Every primitive of a
+ * draw is the same size, so the ones that fit are a prefix. */
+KERNEL(1)
+panlib_xfb_scan(global struct libpan_xfb_draw *d)
+{
+   global uint32_t *counts = (global uint32_t *)d->counts;
+   global uint32_t *first = (global uint32_t *)d->first;
+   global uint32_t *off_in = (global uint32_t *)d->offsets_in;
+   global uint32_t *off_out = (global uint32_t *)d->offsets_out;
+
+   uint32_t total = 0;
+   for (uint32_t i = 0; i < d->invocations; i++) {
+      first[i] = total;
+      total += counts[i * max(d->count_stride, 1u)];
+   }
+
+   uint32_t fit = total;
+   for (uint32_t b = 0; b < 4; b++) {
+      const uint32_t o = off_in[b];
+      d->start[b] = o;
+      if (!d->stride[b])
+         continue;
+      const uint32_t room = d->size[b] > o ? d->size[b] - o : 0;
+      fit = min(fit, room / (d->stride[b] * d->vpp));
+   }
+
+   for (uint32_t b = 0; b < 4; b++)
+      off_out[b] = off_in[b] + fit * d->stride[b] * d->vpp;
+
+   d->written = fit;
+   d->needed = total;
+
+   /* An active transform feedback stream query on this stream. */
+   global uint64_t *stats = (global uint64_t *)d->stats;
+   if (stats) {
+      stats[0] += fit;
+      stats[1] += total;
+   }
+}
+
+/* One thread per emulation invocation: its primitives' vertices, record dword by record dword,
+ * to where the table says. Only the captured dwords are written; gaps keep what was there. */
+KERNEL(64)
+panlib_xfb_copy(global struct libpan_xfb_draw *d)
+{
+   const uint32_t inv = cl_global_id.x;
+   if (inv >= d->invocations)
+      return;
+
+   const uint32_t p0 = ((global uint32_t *)d->first)[inv];
+   const uint32_t written = d->written;
+   if (p0 >= written)
+      return;
+
+   const uint32_t n =
+      min(((global uint32_t *)d->counts)[inv * max(d->count_stride, 1u)], written - p0);
+   const uint32_t vpp = d->vpp;
+   const uint32_t k_dw = d->record_dwords;
+   global uint32_t *idx = (global uint32_t *)d->indices + (uint64_t)inv * d->idx_per_invocation;
+   global uint32_t *staging = (global uint32_t *)d->staging;
+   global uint32_t *table = (global uint32_t *)d->table;
+
+   for (uint32_t p = 0; p < n; p++) {
+      for (uint32_t k = 0; k < vpp; k++) {
+         global uint32_t *rec = staging + (uint64_t)idx[p * vpp + k] * k_dw;
+         const uint64_t v = (uint64_t)(p0 + p) * vpp + k;
+
+         for (uint32_t j = 0; j < k_dw; j++) {
+            const uint32_t e = table[j];
+            const uint32_t b = e >> 16;
+            /* Another stream's buffer (geometryStreams): not this pass's to write. */
+            if (!d->stride[b])
+               continue;
+            global uint32_t *dst =
+               (global uint32_t *)(d->buffer[b] + d->start[b] + v * d->stride[b]);
+            dst[e & 0xffff] = rec[j];
+         }
+      }
+   }
+}
+
+/* vkCmdBegin/EndTransformFeedback with counter buffers: load the write offsets from them
+ * (load != 0, a missing counter starts at 0) or store the offsets into them. */
+KERNEL(1)
+panlib_xfb_counters(global uint32_t *offsets, uint64_t c0, uint64_t c1, uint64_t c2,
+                    uint64_t c3, uint32_t load)
+{
+   const uint64_t c[4] = {c0, c1, c2, c3};
+
+   for (uint32_t b = 0; b < 4; b++) {
+      global uint32_t *counter = (global uint32_t *)c[b];
+      if (load)
+         offsets[b] = counter ? *counter : 0;
+      else if (counter)
+         *counter = offsets[b];
+   }
+}
+
+/* vkCmdEndQuery of a transform feedback stream query: the two totals into the report, then
+ * availability. */
+KERNEL(1)
+panlib_xfb_query_end(global uint64_t *stats, global uint64_t *report, global uint32_t *available)
+{
+   report[0] = stats[0];
+   report[1] = stats[1];
+   *available = 1;
+}
+
+/* vkCmdDrawIndirectByteCountEXT: the vertex count from the bytes the counter says were
+ * captured. */
+KERNEL(1)
+panlib_xfb_byte_count(global uint32_t *counter, global uint32_t *cmd, uint32_t counter_offset,
+                      uint32_t vertex_stride)
+{
+   const uint32_t bytes = *counter;
+   cmd[0] = bytes > counter_offset ? (bytes - counter_offset) / vertex_stride : 0;
+}
+#endif
+
+#if PAN_ARCH >= 9
+/* An indirect draw through the geometry shader emulation: the vertex job's size from the
+ * command, cut to the records allocated, and the same cut into the command the emulation reads,
+ * so it never looks past what the vertex job wrote. Records are laid out per instance at a
+ * padded stride, the encoding the emulation decodes from the DRAW word. */
+KERNEL(1)
+panlib_gs_indirect_setup(global struct libpan_gs_indirect *d)
+{
+   global uint32_t *cmd = (global uint32_t *)d->cmd;
+   const uint32_t n_cmd = cmd[0];
+   uint32_t inst = cmd[1];
+   if (d->count && d->draw >= *(global uint32_t *)d->count)
+      inst = 0;
+
+   const uint32_t n = d->indexed ? n_cmd : min(n_cmd, d->max_vertices);
+   const uint32_t x = max(d->indexed ? d->index_records : n, 1u);
+   const uint32_t stride = pan_padded_vertex_count(x);
+   inst = min(inst, d->records / stride);
+
+   const uint32_t first_vertex = d->indexed ? cmd[3] : cmd[2];
+   const uint32_t first_instance = d->indexed ? cmd[4] : cmd[3];
+
+   d->job_x = x;
+   d->job_y = max(inst, 1u);
+   d->attrib_offset = first_vertex;
+   const uint32_t shift = __builtin_ctz(stride);
+   d->dcd = ((((stride >> shift) - 1) / 2) << 5 | shift) << 16;
+   d->out_cmd[0] = n;
+   d->out_cmd[1] = inst;
+   d->out_cmd[2] = cmd[2];
+   d->out_cmd[3] = cmd[3];
+   d->out_cmd[4] = d->indexed ? cmd[4] : 0;
+   d->zero = 0;
+
+   global uint8_t *fau = (global uint8_t *)d->fau;
+   if (d->first_vertex_off != ~0u)
+      *(global uint32_t *)(fau + d->first_vertex_off) = first_vertex;
+   if (d->base_instance_off != ~0u)
+      *(global uint32_t *)(fau + d->base_instance_off) = first_instance;
+   if (d->stride_off != ~0u)
+      *(global uint32_t *)(fau + d->stride_off) = stride;
+}
+#endif
+
+#if PAN_ARCH == 9
+/* v9 indirect draws: the counts go into the MALLOC_VERTEX job, the base vertex and instance into
+ * the vertex shader's sysvals, and firstInstance into the per-instance attribute offsets (the
+ * descriptors were built for instance 0). An empty draw becomes a NULL job. */
+KERNEL(1)
+panlib_v9_draw_indirect(global struct libpan_v9_indirect_draw *d)
+{
+   global const uint32_t *cmd = (global const uint32_t *)d->cmd;
+   const bool indexed = d->index_buffer != 0;
+   const uint32_t count = cmd[0];
+   const uint32_t instances = cmd[1];
+   const uint32_t first = cmd[2];
+   const int32_t vertex_offset = indexed ? (int32_t)cmd[3] : (int32_t)first;
+   const uint32_t first_instance = indexed ? cmd[4] : cmd[3];
+   global uint8_t *job = (global uint8_t *)d->job;
+
+   if (count == 0 || instances == 0) {
+      struct mali_job_header_packed hdr;
+      pan_pack(&hdr, JOB_HEADER, cfg) {
+         cfg.type = MALI_JOB_TYPE_NULL;
+      }
+      pan_merge((global struct mali_job_header_packed *)job, &hdr, JOB_HEADER);
+      return;
+   }
+
+   global struct mali_primitive_packed *prim =
+      (global struct mali_primitive_packed *)(job +
+                                              pan_section_offset(MALLOC_VERTEX_JOB, PRIMITIVE));
+   pan_unpack(prim, PRIMITIVE, p);
+   pan_pack(prim, PRIMITIVE, cfg) {
+      memcpy(&cfg, &p, sizeof(cfg));
+      cfg.index_count = count;
+      cfg.base_vertex_offset = vertex_offset;
+   }
+
+   pan_pack((global struct mali_count_packed *)(job + pan_section_offset(
+                                                         MALLOC_VERTEX_JOB, INSTANCE_COUNT)),
+            COUNT, cfg) {
+      cfg.count = instances;
+   }
+
+   if (indexed) {
+      pan_pack((global struct mali_indices_packed *)(job + pan_section_offset(
+                                                              MALLOC_VERTEX_JOB, INDICES)),
+               INDICES, cfg) {
+         cfg.address = d->index_buffer + (uint64_t)first * d->index_size;
+      }
+   }
+
+   if (d->first_vertex_sysval)
+      *(global uint32_t *)d->first_vertex_sysval = vertex_offset;
+   if (d->base_instance_sysval)
+      *(global uint32_t *)d->base_instance_sysval = first_instance;
+
+   if (first_instance) {
+      global uint32_t *attribs = (global uint32_t *)d->attribs;
+      for (uint32_t i = 0; i < 16; i++) {
+         if (d->patch_attribs & (1u << i))
+            attribs[i * 8 + 2] += first_instance * d->strides[i];
+      }
+   }
+}
+
+/* Compute Payload words 2 and 3 are the workgroup counts X and Y, word 8 the shader
+ * environment's attribute offset (v9.xml). */
+KERNEL(1)
+panlib_v9_gs_job(global struct libpan_v9_gs_job *j)
+{
+   global const struct libpan_gs_indirect *d = (global const struct libpan_gs_indirect *)j->dims;
+   global uint32_t *payload =
+      (global uint32_t *)((global uint8_t *)j->job + pan_section_offset(COMPUTE_JOB, PAYLOAD));
+
+   payload[2] = d->job_x;
+   payload[3] = d->job_y;
+   payload[8] = d->attrib_offset;
+
+   if (!j->cmd)
+      return;
+   global const uint32_t *cmd = (global const uint32_t *)j->cmd;
+   const uint32_t first_instance = j->indexed ? cmd[4] : cmd[3];
+   if (first_instance) {
+      global uint32_t *attribs = (global uint32_t *)j->attribs;
+      for (uint32_t i = 0; i < 16; i++) {
+         if (j->patch_attribs & (1u << i))
+            attribs[i * 8 + 2] += first_instance * j->strides[i];
+      }
+   }
 }
 #endif

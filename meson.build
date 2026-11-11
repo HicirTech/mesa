@@ -1047,7 +1047,7 @@ with_llvm = with_llvm \
 
 with_poly = [
   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
-  with_kosmickrisp_vk,
+  with_kosmickrisp_vk, with_panfrost_vk, with_gallium_panfrost,
 ].contains(true)
 
 dep_clc = null_dep
@@ -1107,9 +1107,49 @@ with_libbacktrace = get_option('android-libbacktrace') \
   .disable_auto_if(not with_platform_android) \
   .allowed()
 
+# Xclipse fork: the Xclipse code logs through liblog and reads Android properties. A glibc Linux
+# build (PRoot) gets stand-ins for those two headers: logs to stderr, properties as environment
+# variables (include/xclipse_linux_compat).
+if not with_platform_android and host_machine.system() == 'linux'
+  pre_args += ['-isystem', join_paths(meson.current_source_dir(), 'include', 'xclipse_linux_compat')]
+endif
+
 if with_platform_android
   dep_android_ui = null_dep
   dep_android_mapper4 = null_dep
+  # XCLIPSE: the IMapper4 gralloc backend in an android-stub (NDK) build. The NDK ships neither the
+  # HIDL mapper@4.0 headers nor the platform libs, so they come from a deps directory: headers
+  # generated with hidl-gen and the SDK's aidl, and the device's own system libs to link against
+  # (Android 12 ones, the oldest supported, so nothing newer is referenced).
+  xclipse_gralloc = get_option('xclipse-gralloc-deps')
+  if xclipse_gralloc != ''
+    dep_android_mapper4 = declare_dependency(
+      # Flags rather than include_directories(): meson refuses an absolute path into the
+      # source tree, which is where a build directory that generates these usually is.
+      compile_args : ['-I' + xclipse_gralloc / 'include'],
+      link_args : [
+        '-L' + xclipse_gralloc / 'libs-a12',
+        '-lgralloctypes', '-lhidlbase', '-lbase', '-lutils',
+        '-lcutils', '-lnativewindow', '-lsync', '-llog', '-lvndksupport',
+        xclipse_gralloc / 'libs-a12' / 'libc++.so',
+        # '@' in the name: ld needs the explicit path, the dynamic loader takes the SONAME fine
+        xclipse_gralloc / 'libs-a12' / 'android.hardware.graphics.mapper@4.0.so',
+      ],
+    )
+    # libui's GraphicBufferMapper picks the device's mapper itself: IMapper5 (stable-C,
+    # Android 15+, no HIDL service at all on Android 17) down to 2.0. The Android 12 libui
+    # already exports every getter u_gralloc_imapper5_api.cpp looks up.
+    dep_android_ui = declare_dependency(
+      compile_args : ['-I' + xclipse_gralloc / 'include'],
+      link_args : [
+        '-L' + xclipse_gralloc / 'libs-a12',
+        # XCLIPSE: no -lui. u_gralloc_imapper5_api.cpp opens libui.so at run time, so the
+        # driver still loads where libui is not visible (AdrenoTools' vendor namespace).
+        '-lutils', '-lcutils', '-lnativewindow', '-llog',
+        xclipse_gralloc / 'libs-a12' / 'libc++.so',
+      ],
+    )
+  endif
   if not with_android_stub
     dep_android = [
       dependency('cutils'),
@@ -2182,7 +2222,8 @@ if not with_platform_windows and not dep_elf.found()
 endif
 if dep_elf.found()
   pre_args += '-DUSE_LIBELF'
-elif with_gallium_radeonsi and with_gfx_compute
+elif with_gallium_radeonsi and with_gfx_compute and amd_with_llvm
+  # Only LLVM emits ELF shader binaries; ACO binaries are raw (see ac_rtld_stub.c).
   error('Gallium driver radeonsi requires libelf')
 elif with_nouveau_vk
   error('NVK requires libelf')
@@ -2290,13 +2331,16 @@ if with_platform_wayland
     dep_wayland_egl_headers = dep_wayland_egl.partial_dependency(compile_args : true)
   endif
   pre_args += '-DWL_HIDE_DEPRECATED'
-  if cc.has_function(
+  # On Android the libwayland-client found at run time belongs to the host app (Bannerlator's
+  # Wayland mode) and can be older than the one built against: use Mesa's fallbacks instead of
+  # these newer entry points, or the driver fails to load on an undefined symbol.
+  if host_machine.system() != 'android' and cc.has_function(
       'wl_display_dispatch_queue_timeout',
       prefix : '#include <wayland-client.h>',
       dependencies: dep_wayland_client)
     pre_args += ['-DHAVE_WL_DISPATCH_QUEUE_TIMEOUT']
   endif
-  if cc.has_function(
+  if host_machine.system() != 'android' and cc.has_function(
       'wl_display_create_queue_with_name',
       prefix : '#include <wayland-client.h>',
       dependencies: dep_wayland_client)

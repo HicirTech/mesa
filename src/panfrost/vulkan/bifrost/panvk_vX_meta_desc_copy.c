@@ -317,6 +317,98 @@ single_desc_copy(nir_builder *b, nir_def *desc_copy_idx)
    nir_pop_if(b, NULL);
 }
 
+/*
+ * What the desc_copy shader does, done on the CPU while the draw is recorded. This is valid on
+ * v6/v7 because a bound descriptor set cannot change before the command buffer has executed:
+ * update-after-bind and update-unused-while-pending are only exposed from v9. The GPU job it
+ * replaces cost about 25 us per stage per draw on the Mali-G76 (the vertex job waits on it) for
+ * a few dozen bytes; measured in Minecraft, a pass of 45 draws and 270 vertices took 3.5 ms.
+ * Returns false when a table, the copy map or a set is not CPU-visible, and the job is used.
+ */
+static bool
+copy_desc_on_cpu(const struct panvk_shader_desc_info *desc_info,
+                 const struct panvk_descriptor_state *desc_state,
+                 const struct panvk_shader_desc_state *sds,
+                 const struct pan_nir_desc_copy_info *ci)
+{
+   const uint32_t *map = panvk_priv_mem_host_addr(desc_info->others.map);
+   if (!map)
+      return false;
+
+   for (uint32_t t = 0; t < PANVK_BIFROST_DESC_TABLE_COUNT; t++) {
+      if (desc_info->others.count[t] && !sds->tables_cpu[t])
+         return false;
+   }
+   if (desc_info->others.count[PANVK_BIFROST_DESC_TABLE_IMG] && !sds->img_attrib_table_cpu)
+      return false;
+   for (uint32_t s = 0; s < ARRAY_SIZE(desc_state->sets); s++) {
+      if (desc_state->sets[s] && !desc_state->sets[s]->descs.host)
+         return false;
+   }
+
+   const uint32_t *lim = ci->desc_copy.limits;
+   const uint32_t total = lim[PANVK_BIFROST_DESC_TABLE_COUNT - 1];
+
+   for (uint32_t k = 0; k < total; k++) {
+      uint32_t t = 0;
+      while (k >= lim[t])
+         t++;
+      const uint32_t j = k - (t ? lim[t - 1] : 0);
+
+      const uint32_t set_idx = map[k] >> 28;
+      const uint32_t src_idx = map[k] & 0xfffffff;
+      const struct panvk_descriptor_set *set =
+         set_idx < ARRAY_SIZE(desc_state->sets) ? desc_state->sets[set_idx] : NULL;
+      const uint32_t *src =
+         set && src_idx < set->desc_count
+            ? (const uint32_t *)((const uint8_t *)set->descs.host +
+                                 (size_t)src_idx * PANVK_DESCRIPTOR_SIZE)
+            : NULL;
+
+      if (t == PANVK_BIFROST_DESC_TABLE_IMG) {
+         uint32_t *attrib =
+            (uint32_t *)((uint8_t *)sds->img_attrib_table_cpu + j * pan_size(ATTRIBUTE));
+         uint32_t *abuf = (uint32_t *)((uint8_t *)sds->tables_cpu[t] +
+                                       j * pan_size(ATTRIBUTE_BUFFER) * 2);
+         if (!src) {
+            memset(attrib, 0, pan_size(ATTRIBUTE));
+            memset(abuf, 0, pan_size(ATTRIBUTE_BUFFER) * 2);
+            continue;
+         }
+
+         /* Each image takes two attribute buffer slots, after the vertex buffers' ones. */
+         const uint32_t buf_idx = j * 2 + ci->desc_copy.attrib_buf_idx_offset;
+         const bool texel_buffer = (src[0] & BITFIELD_MASK(5)) == MALI_ATTRIBUTE_TYPE_1D;
+
+         if (texel_buffer) {
+            attrib[0] = (src[4] & ~BITFIELD_MASK(9)) | buf_idx;
+            attrib[1] = src[5];
+         } else {
+            attrib[0] = buf_idx | (src[2] & 0xfffffc00);
+            attrib[1] = 0;
+         }
+         abuf[0] = src[0];
+         abuf[1] = src[1];
+         abuf[2] = src[2] & BITFIELD_MASK(7);
+         abuf[3] = src[3];
+         for (uint32_t w = 4; w < 8; w++)
+            abuf[w] = texel_buffer ? 0 : src[w];
+         continue;
+      }
+
+      const size_t elem = t == PANVK_BIFROST_DESC_TABLE_UBO       ? pan_size(ATTRIBUTE)
+                          : t == PANVK_BIFROST_DESC_TABLE_TEXTURE ? pan_size(TEXTURE)
+                                                                  : pan_size(SAMPLER);
+      uint8_t *dst = (uint8_t *)sds->tables_cpu[t] + j * elem;
+      if (src)
+         memcpy(dst, src, elem);
+      else
+         memset(dst, 0, elem);
+   }
+
+   return true;
+}
+
 static uint64_t
 panvk_meta_desc_copy_rsd(struct panvk_device *dev)
 {
@@ -432,6 +524,9 @@ panvk_per_arch(meta_get_copy_desc_job)(
 
       copy_info.tables[i] = shader_desc_state->tables[i];
    }
+
+   if (copy_desc_on_cpu(desc_info, desc_state, shader_desc_state, &copy_info))
+      return VK_SUCCESS;
 
    uint64_t desc_copy_rsd = panvk_meta_desc_copy_rsd(dev);
    if (!desc_copy_rsd)

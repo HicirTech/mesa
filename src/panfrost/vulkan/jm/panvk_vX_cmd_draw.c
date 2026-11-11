@@ -21,6 +21,7 @@
 #include "panvk_cmd_precomp.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
+#include "panvk_gs.h"
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 #include "panvk_instance.h"
@@ -29,6 +30,9 @@
 #include "panvk_shader.h"
 
 #include "draw_helper.h"
+#include "poly/geometry.h"
+#include "poly/tessellator.h"
+#include "kmod/kbase_kmod.h"
 #include "pan_desc.h"
 #include "pan_earlyzs.h"
 #include "pan_encoder.h"
@@ -43,6 +47,13 @@
 
 struct panvk_draw_data {
    struct panvk_draw_info info;
+   /* Indexed indirect draws: where the index search helper leaves the smallest index. */
+   uint64_t index_min_addr;
+   /* The smallest index of a direct draw whose indices were read on the CPU, which the vertex
+    * job starts at; the emulated stages subtract it through index_min_addr. */
+   uint32_t cpu_index_min;
+   /* prepare_vs_attribs allocated new image tables for the vertex shader. */
+   bool vs_img_tables_new;
    unsigned vertex_range;
    unsigned padded_vertex_count;
    struct mali_invocation_packed invocation;
@@ -56,6 +67,9 @@ struct panvk_draw_data {
       uint64_t varyings;
    } fs;
    uint64_t varying_bufs;
+   /* With a geometry shader the tiler reads a DIFFERENT set of varying buffers from the ones the
+    * vertex job wrote: the emulation job in between produces them. Zero when there is no GS. */
+   uint64_t gs_varying_bufs;
    uint64_t position;
    union {
       uint64_t psiz;
@@ -82,11 +96,102 @@ struct panvk_draw_data {
    } indirect_info;
 };
 
+/* Geometry shader input assembly: how the draw's topology groups vertices into the shader's
+ * input primitives, and how many primitives one instance makes. */
+static enum panvk_gs_topology
+gs_topology(enum mesa_prim prim)
+{
+   switch (prim) {
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return PANVK_GS_TOPO_STRIP;
+   case MESA_PRIM_TRIANGLE_FAN:
+      return PANVK_GS_TOPO_FAN;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return PANVK_GS_TOPO_TRI_STRIP_ADJ;
+   default:
+      return PANVK_GS_TOPO_LIST;
+   }
+}
+
+static uint32_t
+gs_prims_per_instance(const struct panvk_draw_data *draw,
+                      const struct panvk_shader_variant *gs)
+{
+   const uint32_t n = draw->info.vertex.count;
+   const uint32_t vpp = MAX2(gs->gs.input_verts_per_prim, 1);
+
+   switch (gs_topology(draw->info.prim)) {
+   case PANVK_GS_TOPO_STRIP:
+      return n >= vpp ? n - (vpp - 1) : 0;
+   case PANVK_GS_TOPO_FAN:
+      return n >= 3 ? n - 2 : 0;
+   case PANVK_GS_TOPO_TRI_STRIP_ADJ:
+      return n >= 6 ? (n - 4) / 2 : 0;
+   default:
+      return n / vpp;
+   }
+}
+
+/* Tessellation: the patches a draw has, and the indices its tess eval job is sized for. 64 is
+ * maxTessellationGenerationLevel, where a quad domain is 64x64 quads of two triangles. */
+static uint32_t
+tess_patches(const struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_data *draw)
+{
+   const uint32_t pcp = MAX2(cmdbuf->vk.dynamic_graphics_state.ts.patch_control_points, 1);
+   return (draw->info.vertex.count / pcp) * draw->info.instance.count;
+}
+
+static uint32_t
+tess_index_cap(const struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_data *draw)
+{
+   /* An indirect draw's patch count is only on the GPU. */
+   if (draw->info.indirect.buffer_dev_addr)
+      return PANVK_TESS_MAX_INDICES;
+   const uint64_t n = (uint64_t)tess_patches(cmdbuf, draw) * 64 * 64 * 6;
+   return MIN2(n, PANVK_TESS_MAX_INDICES);
+}
+
+/* The tess mode: either stage may declare it, the tess eval shader wins. */
+static void
+tess_mode(const struct panvk_cmd_buffer *cmdbuf, enum tess_primitive_mode *prim,
+          enum gl_tess_spacing *spacing, bool *ccw, bool *points)
+{
+   const struct panvk_shader_variant *tcs =
+      panvk_shader_only_variant(cmdbuf->state.gfx.tess.tcs);
+   const struct panvk_shader_variant *tes =
+      panvk_shader_only_variant(cmdbuf->state.gfx.tess.tes);
+   *prim = tes->gs.tess_prim ? tes->gs.tess_prim : tcs->gs.tess_prim;
+   *spacing = tes->gs.tess_spacing ? tes->gs.tess_spacing : tcs->gs.tess_spacing;
+   *ccw = tes->gs.tess_ccw || tcs->gs.tess_ccw;
+   *points = tes->gs.tess_point_mode || tcs->gs.tess_point_mode;
+}
+
+/* An indirect draw is one whose parameters live in GPU memory and are therefore not knowable
+ * while the command buffer is recorded. Being INDEXED is a different property entirely.
+ *
+ * This used to answer true for any indexed draw, which forced every vkCmdDrawIndexed through
+ * the indirect machinery: the descriptors were emitted as placeholders (index_count = 1,
+ * offset_start / instance_size / instance_primitive_size left at zero, vertex_range zero) for two
+ * precompiled OpenCL kernels to patch on the GPU before the vertex job read them. On the Mali job
+ * manager that patch never lands -- measured identically on Mali-G76/arch7/r32p1 and
+ * Mali-G72/arch6/r38p1, and independent of the argument buffer's contents:
+ *
+ *   vkCmdDraw                  triangle rasterised
+ *   vkCmdDrawIndirect          no fault, nothing drawn  (the jobs stay MALI_JOB_TYPE_NULL)
+ *   vkCmdDrawIndexed           event 88 DATA_INVALID on both atoms, even with indexCount = 0
+ *
+ * A placeholder primitive descriptor is precisely what DATA_INVALID describes. The vendor driver
+ * does not use a GPU helper for indexed draws at all -- captured on both devices, its indexed
+ * chain is byte-identical in shape to its array chain (VERTEX -> TILER -> FRAGMENT) with the
+ * descriptor filled in by the CPU -- and so does gallium panfrost, which renders correctly on
+ * this same hardware. So a direct indexed draw takes the CPU path here too, and the helper is
+ * kept for draws that genuinely need it. */
 static bool
 is_indirect_draw(const struct panvk_draw_data *draw)
 {
-   return draw->info.indirect.buffer_dev_addr != 0 ||
-          draw->info.index.index_size != 0;
+   return draw->info.indirect.buffer_dev_addr != 0;
 }
 
 static bool
@@ -427,6 +532,7 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
       ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
    uint64_t psiz_buf = 0;
 
+   uint64_t buf_addrs_general = 0;
    for (unsigned i = 0; i < PANVK_VARY_BUF_MAX; i++) {
       uint32_t buf_size;
       uint64_t buf_addr;
@@ -436,13 +542,16 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
       } else {
          buf_size = draw->padded_vertex_count * draw->info.instance.count *
                     link->buf_strides[i];
-         buf_addr =
-            buf_size
-               ? panvk_cmd_alloc_dev_mem(cmdbuf, varying, buf_size, 64).gpu
-               : 0;
+         struct pan_ptr vb =
+            buf_size ? panvk_cmd_alloc_dev_mem(cmdbuf, varying, buf_size, 64)
+                     : (struct pan_ptr){0};
+         buf_addr = vb.gpu;
 
          if (buf_size && !buf_addr)
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+         if (i == PANVK_VARY_BUF_POSITION)
+            panvk_gs_dbg_in_pos_cpu = vb.cpu;
       }
 
       pan_pack(&buf_descs[i], ATTRIBUTE_BUFFER, cfg) {
@@ -456,6 +565,9 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
 
       if (i == PANVK_VARY_BUF_PSIZ)
          psiz_buf = buf_addr;
+
+      if (i == PANVK_VARY_BUF_GENERAL)
+         buf_addrs_general = buf_addr;
    }
 
    /* We need an empty entry to stop prefetching on Bifrost */
@@ -465,12 +577,220 @@ panvk_draw_prepare_varyings(struct panvk_cmd_buffer *cmdbuf,
    if (writes_point_size)
       draw->psiz = psiz_buf;
    else if (ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
-            ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP)
+            ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
+            (cmdbuf->state.gfx.gs.shader &&
+             cmdbuf->state.gfx.gs.shader != cmdbuf->state.gfx.gs.app_shader &&
+             cmdbuf->vk.dynamic_graphics_state.rs.polygon_mode == VK_POLYGON_MODE_LINE))
       draw->line_width = cmdbuf->vk.dynamic_graphics_state.rs.line.width;
    else
       draw->line_width = 1.0f;
 
    draw->varying_bufs = bufs.gpu;
+
+   /* --- geometry shader emulation: the second set of varying buffers ----------------------
+    *
+    * The vertex job writes the buffers built above. With a geometry shader bound, the tiler must
+    * instead read what the emulation compute job produces, so allocate a parallel set here, sized
+    * for the worst case (every input primitive emits its full declared maximum) because the real
+    * count is not known until the shader runs and this driver cannot have a compute job patch the
+    * tiler descriptor. See panvk_nir_lower_gs.c.
+    */
+   const struct panvk_shader *gs_shader = cmdbuf->state.gfx.gs.shader;
+   if (gs_shader) {
+      const struct panvk_shader_variant *gs = panvk_shader_only_variant(gs_shader);
+      /* Every (input primitive, gl_InvocationID) pair over every instance is one invocation of
+       * the emulation, with its own worst-case slice of the output. An indirect draw's count is
+       * only on the GPU, so it gets the cap. */
+      const uint32_t in_prims =
+         (cmdbuf->state.gfx.tess.tes ? tess_index_cap(cmdbuf, draw) /
+                                          MAX2(gs->gs.input_verts_per_prim, 1)
+          : is_indirect_draw(draw)   ? PANVK_GS_INDIRECT_MAX_PRIMS
+                                     : gs_prims_per_instance(draw, gs) * draw->info.instance.count) *
+         gs->gs.invocations;
+      const uint32_t out_verts = in_prims * gs->gs.max_output_verts;
+      const uint32_t out_indices =
+         in_prims * gs->gs.max_output_prims * gs->gs.output_verts_per_prim;
+
+      struct pan_ptr gs_bufs = panvk_cmd_alloc_desc_array(
+         cmdbuf, PANVK_VARY_BUF_MAX + 1, ATTRIBUTE_BUFFER);
+      if (!gs_bufs.gpu)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      struct mali_attribute_buffer_packed *gs_descs = gs_bufs.cpu;
+      uint64_t gs_addrs[PANVK_VARY_BUF_MAX] = {0};
+
+      void *gs_pos_cpu = NULL;
+      for (unsigned i = 0; i < PANVK_VARY_BUF_MAX; i++) {
+         /* The generic buffer is the emulation's own layout (link->gs_out_stride). */
+         const uint32_t buf_stride =
+            i == PANVK_VARY_BUF_GENERAL ? link->gs_out_stride : link->buf_strides[i];
+         const uint32_t sz = out_verts * buf_stride;
+         /* NOT the varying pool. The vertex shader reaches that through the varying unit,
+          * and a plain compute store into it does not land -- measured: the same store to the
+          * descriptor pool appeared and this one did not. The tiler only needs a pointer and a
+          * stride, so ordinary GPU memory serves. */
+         struct pan_ptr vb =
+            sz ? panvk_cmd_alloc_dev_mem(cmdbuf, desc, sz, 64)
+               : (struct pan_ptr){0};
+         gs_addrs[i] = vb.gpu;
+         if (sz && !gs_addrs[i])
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         if (i == PANVK_VARY_BUF_POSITION)
+            gs_pos_cpu = vb.cpu;
+
+         pan_pack(&gs_descs[i], ATTRIBUTE_BUFFER, cfg) {
+            cfg.stride = buf_stride;
+            cfg.size = sz;
+            cfg.pointer = gs_addrs[i];
+         }
+      }
+      memset(gs_bufs.cpu + (pan_size(ATTRIBUTE_BUFFER) * PANVK_VARY_BUF_MAX), 0,
+             pan_size(ATTRIBUTE_BUFFER));
+
+      struct pan_ptr idx =
+         panvk_cmd_alloc_dev_mem(cmdbuf, desc, MAX2(out_indices, 1) * 4, 4);
+      if (!idx.gpu)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      draw->gs_varying_bufs = gs_bufs.gpu;
+      cmdbuf->state.gfx.gs.out_pos = gs_addrs[PANVK_VARY_BUF_POSITION];
+      cmdbuf->state.gfx.gs.out_general = gs_addrs[PANVK_VARY_BUF_GENERAL];
+      cmdbuf->state.gfx.gs.out_index = idx.gpu;
+      cmdbuf->state.gfx.gs.in_general = buf_addrs_general;
+      cmdbuf->state.gfx.gs.in_general_stride =
+         link->buf_strides[PANVK_VARY_BUF_GENERAL];
+      cmdbuf->state.gfx.gs.out_general_stride = link->gs_out_stride;
+      cmdbuf->state.gfx.gs.out_vertex_count = out_verts;
+      cmdbuf->state.gfx.gs.out_index_count = out_indices;
+      /* The emulation writes an index buffer describing INDEPENDENT primitives, so whatever
+       * strip the shader declared, the tiler draws a list. */
+      cmdbuf->state.gfx.gs.out_prim =
+         gs->gs.output_verts_per_prim == 3   ? MESA_PRIM_TRIANGLES
+         : gs->gs.output_verts_per_prim == 2 ? MESA_PRIM_LINES
+                                             : MESA_PRIM_POINTS;
+      /* The tess eval job writes one vertex per tessellator index, in index order, so the
+       * identity index buffer it leaves draws the tessellator's own primitives. */
+      if (gs_shader == cmdbuf->state.gfx.tess.tes) {
+         enum tess_primitive_mode prim;
+         enum gl_tess_spacing spacing;
+         bool ccw, points;
+         tess_mode(cmdbuf, &prim, &spacing, &ccw, &points);
+         cmdbuf->state.gfx.gs.out_prim = points ? MESA_PRIM_POINTS
+                                         : prim == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
+                                                                          : MESA_PRIM_TRIANGLES;
+      }
+
+      /* The slot -> byte offset tables the lowered shader reads: the vertex shader's generic
+       * layout on the way in, the emulation's own on the way out. */
+      struct pan_ptr offs =
+         panvk_cmd_alloc_dev_mem(cmdbuf, desc, 2 * VARYING_SLOT_MAX * 4, 4);
+      if (!offs.gpu)
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      uint32_t *offs_cpu = offs.cpu;
+      memcpy(offs_cpu, link->buf_offsets, VARYING_SLOT_MAX * 4);
+      memcpy(offs_cpu + VARYING_SLOT_MAX, link->gs_out_offsets, VARYING_SLOT_MAX * 4);
+      cmdbuf->state.gfx.gs.in_offsets = offs.gpu;
+      cmdbuf->state.gfx.gs.out_offsets = offs.gpu + VARYING_SLOT_MAX * 4;
+
+      /* Transform feedback: a primitive count per emulation invocation and a capture record per
+       * output vertex slot. Captured once per draw, on its first layer. */
+      cmdbuf->state.gfx.gs.xfb_counts = 0;
+      cmdbuf->state.gfx.gs.xfb_staging = 0;
+      cmdbuf->state.gfx.gs.xfb_invocations = 0;
+      cmdbuf->state.gfx.gs.xfb_stream_index = 0;
+      cmdbuf->state.gfx.gs.xfb_stream_slots = 0;
+      cmdbuf->state.gfx.gs.xfb_stream_idx = 0;
+      if (cmdbuf->state.gfx.xfb.active && gs->gs.xfb_dwords && draw->info.layer_id == 0 &&
+          in_prims) {
+         /* geometryStreams: every stream up to the last one emitted on gets its own copy of the
+          * vertex slots, counts and (past stream 0) index lists. */
+         const unsigned nstreams = util_last_bit(gs->gs.stream_mask);
+         const uint32_t slots = MAX2(out_verts, 1);
+         const uint32_t idx = in_prims * gs->gs.max_output_prims * gs->gs.output_verts_per_prim;
+         struct pan_ptr counts =
+            panvk_cmd_alloc_dev_mem(cmdbuf, desc, nstreams * in_prims * 4, 4);
+         struct pan_ptr staging = panvk_cmd_alloc_dev_mem(
+            cmdbuf, desc, nstreams * slots * gs->gs.xfb_dwords * 4, 4);
+         struct pan_ptr stream_index = {0};
+         if (nstreams > 1)
+            stream_index = panvk_cmd_alloc_dev_mem(cmdbuf, desc, (nstreams - 1) * idx * 4, 4);
+         if (!counts.gpu || !staging.gpu || (nstreams > 1 && !stream_index.gpu))
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         cmdbuf->state.gfx.gs.xfb_counts = counts.gpu;
+         cmdbuf->state.gfx.gs.xfb_staging = staging.gpu;
+         cmdbuf->state.gfx.gs.xfb_invocations = in_prims;
+         cmdbuf->state.gfx.gs.xfb_stream_index = stream_index.gpu;
+         cmdbuf->state.gfx.gs.xfb_stream_slots = slots;
+         cmdbuf->state.gfx.gs.xfb_stream_idx = idx;
+      }
+
+      /* Bisect switches, read once so they cannot cost anything on the default path. */
+      static int cpufill_mode = -1;
+      static int in_from_cpu = -1;
+      if (cpufill_mode < 0) {
+         const char *e = getenv("PANVK_GS_CPUFILL");
+         cpufill_mode = (e && e[0] >= '1' && e[0] <= '3') ? e[0] - '0' : 0;
+         in_from_cpu = getenv("PANVK_GS_INFROMCPU") != NULL;
+      }
+
+      cmdbuf->state.gfx.gs.in_pos_override = 0;
+      if (in_from_cpu) {
+         struct pan_ptr ip = panvk_cmd_alloc_dev_mem(cmdbuf, desc, 48, 64);
+         if (ip.gpu) {
+            /* CLIP space: the emulation's input is (vs_keep_clip_space). On a 64x64
+             * target this is (4,60) (60,60) (32,4) in pixels. */
+            static const float tri[3][4] = {
+               {-0.875f, 0.875f, 0.5f, 1.0f},
+               {0.875f, 0.875f, 0.5f, 1.0f},
+               {0.0f, -0.875f, 0.5f, 1.0f},
+            };
+            memcpy(ip.cpu, tri, sizeof(tri));
+            cmdbuf->state.gfx.gs.in_pos_override = ip.gpu;
+         }
+      }
+
+      panvk_gs_dbg_pos_cpu = gs_pos_cpu;
+      panvk_gs_dbg_idx_cpu = idx.cpu;
+      panvk_gs_dbg_idx_count = out_indices;
+      panvk_gs_dbg_pos_gpu = gs_addrs[PANVK_VARY_BUF_POSITION];
+      panvk_gs_dbg_pos_verts = out_verts;
+
+      /* -- BISECT: PANVK_GS_CPUFILL --------------------------------------------------------
+       * Every attempt so far judged the emulation job's position stores from a rendered image,
+       * which cannot tell "the store did not land" apart from "the tiler was told something
+       * wrong". A CPU write demonstrably lands. So author the tiler's whole input here, skip
+       * the emulation job entirely, and turn culling off: if THIS triangle does not appear,
+       * the shader stores are innocent and the fault is in the tiler descriptors. */
+      cmdbuf->state.gfx.gs.cpufill = false;
+      cmdbuf->state.gfx.gs.posonly = false;
+      cmdbuf->state.gfx.gs.keepjob = false;
+      if (gs_pos_cpu && cpufill_mode && out_verts >= 3) {
+         /* SCREEN SPACE, not NDC: nir_lower_viewport_transform (bifrost_nir.c) rewrites the
+          * vertex shader's gl_Position into screen-space xyz with w = 1/w, so that is what the
+          * tiler expects to find here. The values are for a 64x64 attachment. */
+         static const float tri[3][4] = {
+            {4.0f, 60.0f, 0.5f, 1.0f},
+            {60.0f, 60.0f, 0.5f, 1.0f},
+            {32.0f, 4.0f, 0.5f, 1.0f},
+         };
+         memcpy(gs_pos_cpu, tri, sizeof(tri));
+         uint32_t *idx_cpu = idx.cpu;
+         for (unsigned i = 0; i < out_indices; i++)
+            idx_cpu[i] = i < 3 ? i : 0;
+         cmdbuf->state.gfx.gs.out_index_count = 3;
+         cmdbuf->state.gfx.gs.cpufill = true;
+         cmdbuf->state.gfx.gs.posonly = cpufill_mode == 2;
+         cmdbuf->state.gfx.gs.keepjob = cpufill_mode == 3;
+         fprintf(stderr,
+                 "[GSFILL] pos=%p/0x%" PRIx64 " idx=0x%" PRIx64
+                 " out_verts=%u pos_stride=%u\n",
+                 gs_pos_cpu, gs_addrs[PANVK_VARY_BUF_POSITION], idx.gpu,
+                 out_verts, link->buf_strides[PANVK_VARY_BUF_POSITION]);
+      }
+   } else {
+      draw->gs_varying_bufs = 0;
+   }
+
    draw->vs.varyings = panvk_priv_mem_dev_addr(link->vs.attribs);
    draw->fs.varyings = panvk_priv_mem_dev_addr(link->fs.attribs);
    return VK_SUCCESS;
@@ -591,10 +911,9 @@ panvk_draw_emit_attrib(const struct panvk_draw_data *draw,
    }
 }
 
-/* Don't re-use vertex attributes, always re-emit them.  Descriptors depend on
- * per-draw parameters (e.g. vertex_count, instancing), which are likely to
- * change every draw, so don't bother trying to save an attribute[_buffer]
- * re-emission.
+/* Vertex attributes are re-emitted when a draw parameter they depend on can differ (instancing,
+ * indirect draws, vertex images); otherwise they are reused until the vertex input changes. A new
+ * copy per draw was a twelfth of the CPU time of a draw-heavy frame on Mali-G76.
  */
 static VkResult
 panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
@@ -613,6 +932,17 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
                : MAX2(util_last_bit(vi->attributes_valid),
                       vs_variant->info.attribute_count);
    unsigned attrib_count = num_vs_attribs + num_imgs;
+
+   /* Only instancing (the divisors), indirect patching and the image tables tie the descriptors
+    * to one draw. */
+   const bool reusable = !num_imgs && !is_indirect_draw(draw) && draw->info.instance.count <= 1;
+   if (reusable && cmdbuf->state.gfx.vs.attribs_reusable &&
+       cmdbuf->state.gfx.vs.attribs_base_instance == draw->info.instance.base &&
+       !gfx_state_dirty(cmdbuf, VB) && !gfx_state_dirty(cmdbuf, VS) &&
+       !gfx_state_dirty(cmdbuf, GS) && !dyn_gfx_state_dirty(cmdbuf, VI) &&
+       !dyn_gfx_state_dirty(cmdbuf, VI_BINDINGS_VALID) &&
+       !dyn_gfx_state_dirty(cmdbuf, VI_BINDING_STRIDES))
+      return VK_SUCCESS;
 
    unsigned attrib_buf_count = (num_vbs + num_imgs) * 2;
    struct pan_ptr bufs = panvk_cmd_alloc_desc_array(
@@ -681,12 +1011,21 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
 
    cmdbuf->state.gfx.vs.attrib_bufs = bufs.gpu;
    cmdbuf->state.gfx.vs.attribs = attribs.gpu;
+   cmdbuf->state.gfx.vs.attribs_reusable = reusable;
+   cmdbuf->state.gfx.vs.attribs_base_instance = draw->info.instance.base;
 
    if (num_imgs) {
       cmdbuf->state.gfx.vs.desc.img_attrib_table =
          attribs.gpu + (MAX_VS_ATTRIBS * pan_size(ATTRIBUTE));
       cmdbuf->state.gfx.vs.desc.tables[PANVK_BIFROST_DESC_TABLE_IMG] =
          bufs.gpu + (num_vbs * pan_size(ATTRIBUTE_BUFFER) * 2);
+      cmdbuf->state.gfx.vs.desc.img_attrib_table_cpu =
+         (uint8_t *)attribs.cpu + (MAX_VS_ATTRIBS * pan_size(ATTRIBUTE));
+      cmdbuf->state.gfx.vs.desc.tables_cpu[PANVK_BIFROST_DESC_TABLE_IMG] =
+         (uint8_t *)bufs.cpu + (num_vbs * pan_size(ATTRIBUTE_BUFFER) * 2);
+      /* Fresh image tables: the vertex shader's image descriptors have to be copied into them,
+       * even when the descriptor state itself did not change. */
+      draw->vs_img_tables_new = true;
    }
 
    return VK_SUCCESS;
@@ -713,26 +1052,42 @@ panvk_emit_viewport(struct panvk_cmd_buffer *cmdbuf,
    if (vp->viewport_count < 1)
       return;
 
-   const VkViewport *viewport = &vp->viewports[0];
-   const VkRect2D *scissor = &vp->scissors[0];
    float minz, maxz;
    panvk_depth_range(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state.vp,
                      &minz, &maxz);
 
-   /* The spec says "width must be greater than 0.0" */
-   assert(viewport->width >= 0);
-   int minx = (int)viewport->x;
-   int maxx = (int)(viewport->x + viewport->width);
+   /* A geometry shader writing gl_ViewportIndex can put a primitive in any viewport: the tiler's
+    * one scissor is the union of them all, and the fragment shader keeps each primitive inside
+    * its own (panvk_nir_lower_viewport_scissor_fs). */
+   const bool multi = cmdbuf->state.gfx.gs.shader &&
+                      panvk_shader_only_variant(cmdbuf->state.gfx.gs.shader)->gs.writes_viewport;
+   const unsigned count = multi ? vp->viewport_count : 1;
 
-   /* Viewport height can be negative */
-   int miny = MIN2((int)viewport->y, (int)(viewport->y + viewport->height));
-   int maxy = MAX2((int)viewport->y, (int)(viewport->y + viewport->height));
+   int minx = INT_MAX, miny = INT_MAX, maxx = INT_MIN, maxy = INT_MIN;
+   for (unsigned i = 0; i < count; i++) {
+      const VkViewport *viewport = &vp->viewports[i];
+      const VkRect2D *scissor = &vp->scissors[i];
 
-   assert(scissor->offset.x >= 0 && scissor->offset.y >= 0);
-   minx = MAX2(scissor->offset.x, minx);
-   miny = MAX2(scissor->offset.y, miny);
-   maxx = MIN2(scissor->offset.x + scissor->extent.width, maxx);
-   maxy = MIN2(scissor->offset.y + scissor->extent.height, maxy);
+      /* The spec says "width must be greater than 0.0" */
+      assert(viewport->width >= 0);
+      int vminx = (int)viewport->x;
+      int vmaxx = (int)(viewport->x + viewport->width);
+
+      /* Viewport height can be negative */
+      int vminy = MIN2((int)viewport->y, (int)(viewport->y + viewport->height));
+      int vmaxy = MAX2((int)viewport->y, (int)(viewport->y + viewport->height));
+
+      assert(scissor->offset.x >= 0 && scissor->offset.y >= 0);
+      vminx = MAX2(scissor->offset.x, vminx);
+      vminy = MAX2(scissor->offset.y, vminy);
+      vmaxx = MIN2(scissor->offset.x + scissor->extent.width, vmaxx);
+      vmaxy = MIN2(scissor->offset.y + scissor->extent.height, vmaxy);
+
+      minx = MIN2(minx, vminx);
+      miny = MIN2(miny, vminy);
+      maxx = MAX2(maxx, vmaxx);
+      maxy = MAX2(maxy, vmaxy);
+   }
 
    /* Make sure we don't end up with a max < min when width/height is 0 */
    maxx = maxx > minx ? maxx - 1 : maxx;
@@ -763,6 +1118,7 @@ panvk_draw_prepare_viewport(struct panvk_cmd_buffer *cmdbuf,
     * As a result, we define an empty one.
     */
    if (!cmdbuf->state.gfx.vpd || dyn_gfx_state_dirty(cmdbuf, VP_VIEWPORTS) ||
+       gfx_state_dirty(cmdbuf, GS) ||
        dyn_gfx_state_dirty(cmdbuf, VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE) ||
        dyn_gfx_state_dirty(cmdbuf, VP_SCISSORS) ||
        dyn_gfx_state_dirty(cmdbuf, RS_DEPTH_CLIP_ENABLE) ||
@@ -888,7 +1244,10 @@ panvk_emit_tiler_primitive(struct panvk_cmd_buffer *cmdbuf,
    bool fs_reads_primitive_id = fs ? fs->info.fs.reads_primitive_id : false;
 
    pan_pack(prim, PRIMITIVE, cfg) {
-      cfg.draw_mode = translate_prim(draw->info.prim);
+      cfg.draw_mode = translate_prim(draw->gs_varying_bufs &&
+                                        !cmdbuf->state.gfx.gs.posonly
+                                        ? cmdbuf->state.gfx.gs.out_prim
+                                        : draw->info.prim);
       if (writes_point_size)
          cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
       cfg.primitive_index_enable = fs_reads_primitive_id;
@@ -919,6 +1278,28 @@ panvk_emit_tiler_primitive(struct panvk_cmd_buffer *cmdbuf,
 
       /* In case of indirect draw, the descriptor will be patched at runtime */
       cfg.index_count = is_indirect_draw(draw) ? 1 : draw->info.vertex.count;
+
+      /* The index buffer address and the base vertex offset were previously written ONLY by
+       * panlib_patch_draw_tiler_dcd, because every indexed draw was classified as indirect. A
+       * direct indexed draw has to carry them itself, with the same arithmetic the helper uses:
+       * indices are biased by the first index, and base_vertex_offset cancels the offset_start
+       * that the vertex job already applied, so the tiler resolves index i to the varying slot
+       * the vertex shader actually wrote. */
+      /* With a geometry shader the tiler does not draw the application's primitives at all: it
+       * draws what the emulation job produced, as an indexed list over the index buffer that job
+       * filled in. The counts are the worst-case ones fixed at record time. */
+      if (draw->gs_varying_bufs && !cmdbuf->state.gfx.gs.posonly) {
+         cfg.index_type = MALI_INDEX_TYPE_UINT32;
+         cfg.index_count = cmdbuf->state.gfx.gs.out_index_count;
+         cfg.indices = cmdbuf->state.gfx.gs.out_index;
+         cfg.base_vertex_offset = 0;
+      } else if (!is_indirect_draw(draw) && draw->info.index.index_size) {
+         cfg.indices = draw->info.index.buffer_dev_addr +
+                       (uint64_t)draw->info.index.offset *
+                          draw->info.index.index_size;
+         cfg.base_vertex_offset =
+            (int64_t)draw->info.vertex.base - draw->info.vertex.raw_offset;
+      }
 
       cfg.low_depth_cull = cfg.high_depth_cull =
          vk_rasterization_state_depth_clip_enable(rs);
@@ -955,24 +1336,33 @@ panvk_emit_tiler_dcd(struct panvk_cmd_buffer *cmdbuf,
    const struct vk_rasterization_state *rs =
       &cmdbuf->vk.dynamic_graphics_state.rs;
 
-   enum mesa_prim reduced_prim = u_reduced_prim(draw->info.prim);
+   /* What the tiler draws: a geometry shader's output replaces the application's primitives. */
+   enum mesa_prim reduced_prim = u_reduced_prim(
+      draw->gs_varying_bufs && !cmdbuf->state.gfx.gs.posonly ? cmdbuf->state.gfx.gs.out_prim
+                                                             : draw->info.prim);
    const bool non_polygon = reduced_prim != MESA_PRIM_TRIANGLES;
 
    pan_pack(dcd, DRAW, cfg) {
       cfg.front_face_ccw = rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
       cfg.cull_front_face =
-         !non_polygon && (rs->cull_mode & VK_CULL_MODE_FRONT_BIT) != 0;
+         !non_polygon && !cmdbuf->state.gfx.gs.cpufill &&
+         (rs->cull_mode & VK_CULL_MODE_FRONT_BIT) != 0;
       cfg.cull_back_face =
-         !non_polygon && (rs->cull_mode & VK_CULL_MODE_BACK_BIT) != 0;
+         !non_polygon && !cmdbuf->state.gfx.gs.cpufill &&
+         (rs->cull_mode & VK_CULL_MODE_BACK_BIT) != 0;
 
-      cfg.position = draw->position;
+      /* The tiler reads positions from what the geometry job produced, not from what the vertex
+       * job wrote. */
+      cfg.position = draw->gs_varying_bufs ? cmdbuf->state.gfx.gs.out_pos
+                                           : draw->position;
       cfg.state = draw->fs.rsd;
       cfg.attributes = fs_desc_state->img_attrib_table;
       cfg.attribute_buffers =
          fs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_IMG];
       cfg.viewport = draw->viewport;
       cfg.varyings = draw->fs.varyings;
-      cfg.varying_buffers = cfg.varyings ? draw->varying_bufs : 0;
+      cfg.varying_buffers =
+         cfg.varyings ? (draw->gs_varying_bufs ?: draw->varying_bufs) : 0;
       cfg.thread_storage = draw->tls;
 
       /* For all primitives but lines DRAW.flat_shading_vertex must
@@ -983,7 +1373,11 @@ panvk_emit_tiler_dcd(struct panvk_cmd_buffer *cmdbuf,
          cfg.flat_shading_vertex = true;
 
       /* In case of indirect draw, the descriptor will be patched at runtime */
-      if (!is_indirect_draw(draw)) {
+      if (draw->gs_varying_bufs && !cmdbuf->state.gfx.gs.posonly) {
+         cfg.offset_start = 0;
+         cfg.instance_size = 1;
+         cfg.instance_primitive_size = 0;
+      } else if (!is_indirect_draw(draw)) {
          cfg.offset_start = draw->info.vertex.raw_offset;
          cfg.instance_size =
             draw->info.instance.count > 1 ? draw->padded_vertex_count : 1;
@@ -1043,8 +1437,15 @@ panvk_draw_prepare_tiler_job(struct panvk_cmd_buffer *cmdbuf,
    util_dynarray_append(&batch->jobs, ptr.cpu);
    draw->jobs.tiler = ptr;
 
-   memcpy(pan_section_ptr(ptr.cpu, TILER_JOB, INVOCATION), &draw->invocation,
-          pan_size(INVOCATION));
+   if (draw->gs_varying_bufs && !cmdbuf->state.gfx.gs.posonly) {
+      /* The tiler iterates the geometry shader's output, not the vertex shader's. */
+      pan_pack_work_groups_compute(
+         pan_section_ptr(ptr.cpu, TILER_JOB, INVOCATION), 1,
+         cmdbuf->state.gfx.gs.out_vertex_count, 1, 1, 1, 1, true, false);
+   } else {
+      memcpy(pan_section_ptr(ptr.cpu, TILER_JOB, INVOCATION), &draw->invocation,
+             pan_size(INVOCATION));
+   }
 
    panvk_emit_tiler_primitive(cmdbuf, draw,
                               pan_section_ptr(ptr.cpu, TILER_JOB, PRIMITIVE));
@@ -1162,16 +1563,18 @@ panvk_cmd_prepare_draw_link_shaders(struct panvk_cmd_buffer *cmd)
 {
    struct panvk_cmd_graphics_state *gfx = &cmd->state.gfx;
 
-   if (!gfx_state_dirty(cmd, VS) && !gfx_state_dirty(cmd, FS))
+   if (!gfx_state_dirty(cmd, VS) && !gfx_state_dirty(cmd, FS) && !gfx_state_dirty(cmd, GS))
       return VK_SUCCESS;
 
    const struct panvk_shader_variant *vs =
       panvk_shader_hw_variant(cmd->state.gfx.vs.shader);
    const struct panvk_shader_variant *fs =
       panvk_shader_only_variant(get_fs(cmd));
+   const struct panvk_shader_variant *gs =
+      cmd->state.gfx.gs.shader ? panvk_shader_only_variant(cmd->state.gfx.gs.shader) : NULL;
 
    VkResult result =
-      panvk_per_arch(link_shaders)(&cmd->desc_pool, vs, fs, &gfx->link);
+      panvk_per_arch(link_shaders)(&cmd->desc_pool, vs, gs, fs, &gfx->link);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return result;
@@ -1199,13 +1602,13 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
     * pilot shader dealing with descriptor copies, and we need one
     * <vertex,tiler> pair per draw.
     */
-   if (batch->vtc_jc.job_index + (4 * cmdbuf->state.gfx.render.layer_count) >=
+   if (batch->vtc_jc.job_index + (4 * cmdbuf->state.gfx.render.layer_count) + PANVK_TILER_LAG >=
        UINT16_MAX) {
       panvk_per_arch(cmd_close_batch)(cmdbuf);
       batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
    }
 
-   if (fs_user_dirty(cmdbuf)) {
+   if (fs_user_dirty(cmdbuf) || gfx_state_dirty(cmdbuf, VS) || gfx_state_dirty(cmdbuf, GS)) {
       result = panvk_cmd_prepare_draw_link_shaders(cmdbuf);
       if (result != VK_SUCCESS)
          return result;
@@ -1291,7 +1694,8 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
     */
    panvk_draw_prepare_attributes(cmdbuf, draw);
 
-   if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS)) {
+   if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS) ||
+       draw->vs_img_tables_new) {
       result = panvk_draw_prepare_vs_copy_desc_job(cmdbuf, draw);
       if (result != VK_SUCCESS)
          return result;
@@ -1351,6 +1755,8 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
       panvk_shader_only_variant(get_fs(cmdbuf));
    VkResult result;
 
+   /* Before the varyings: transform feedback captures on the first layer only. */
+   draw->info.layer_id = layer;
    result = panvk_draw_prepare_varyings(cmdbuf, draw);
    if (result != VK_SUCCESS)
       return result;
@@ -1358,17 +1764,23 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
    draw->info.layer_id = layer;
    if (draw->info.layer_id > 0) {
       cmdbuf->state.gfx.sysvals.layer_id = draw->info.layer_id;
+      gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
       gfx_state_set_dirty(cmdbuf, FS_PUSH_UNIFORMS);
    }
 
-   struct pan_ptr vs_push_uniforms;
-   result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
-      cmdbuf, vs, &vs_push_uniforms, 1);
-   if (result != VK_SUCCESS)
-      return result;
-   cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+   /* Uploaded again only when they changed: the previous draw's are still in the pool, and a
+    * new copy per draw was a tenth of the CPU time of a draw-heavy frame. */
+   if (!cmdbuf->state.gfx.vs.push_uniforms || gfx_state_dirty(cmdbuf, VS_PUSH_UNIFORMS)) {
+      struct pan_ptr vs_push_uniforms;
+      result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+         cmdbuf, vs, &vs_push_uniforms, 1);
+      if (result != VK_SUCCESS)
+         return result;
+      cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+   }
 
-   if (fs) {
+   if (fs && (!cmdbuf->state.gfx.fs.push_uniforms || fs_user_dirty(cmdbuf) ||
+              gfx_state_dirty(cmdbuf, FS_PUSH_UNIFORMS))) {
       struct pan_ptr fs_push_uniforms;
       result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
          cmdbuf, fs, &fs_push_uniforms, 1);
@@ -1390,10 +1802,16 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
       if (result != VK_SUCCESS)
          return result;
 
+      /* Without a geometry or tessellation stage the tiler reads the vertex shader's positions.
+       * A vertex shader that writes none leaves them undefined, so nothing is rasterized, as on
+       * the vendor driver, rather than the tiler reading whatever the buffer held. */
+      const bool writes_pos =
+         cmdbuf->state.gfx.gs.shader ||
+         pan_varying_layout_find_slot(&vs->info.varyings.formats, VARYING_SLOT_POS);
       bool needs_tiling =
-         !cmdbuf->vk.dynamic_graphics_state.rs.rasterizer_discard_enable ||
-         cmdbuf->state.gfx.occlusion_query.mode !=
-            MALI_OCCLUSION_MODE_DISABLED;
+         writes_pos &&
+         (!cmdbuf->vk.dynamic_graphics_state.rs.rasterizer_discard_enable ||
+          cmdbuf->state.gfx.occlusion_query.mode != MALI_OCCLUSION_MODE_DISABLED);
 
       if (needs_tiling) {
          result = panvk_draw_prepare_tiler_job(cmdbuf, draw);
@@ -1403,6 +1821,755 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
    }
 
    return VK_SUCCESS;
+}
+
+/*
+ * A CACHE_FLUSH job between a job that writes memory and a later job in the same chain that reads
+ * it: the vertex job and the geometry shader emulation, and each indirect draw helper and what it
+ * patches (see panvk_cmd_draw_indirect).
+ *
+ * NOT EMITTED BY DEFAULT ANY MORE. Every one of these was added against a measured failure --
+ * the emulation read zeros from the vertex shader's varyings, a vertex job fetched descriptors
+ * as the CPU wrote them instead of as the helper patched them, the tiler drew only the indices
+ * that had landed -- and every one of those failures came from the same place: memory allocated
+ * without BASE_MEM_COHERENT_LOCAL, on which the GPU's own units do not see one another's writes
+ * (kbase_kmod.c). With that bit set, every draw test passes on Mali-G76 and Mali-G72
+ * with no flush job at all, and a job dependency orders memory as it does for the vendor.
+ * PANVK_FLUSH_JOBS=1 puts them back, for A/B only.
+ */
+static unsigned
+emit_cache_flush_job(struct panvk_cmd_buffer *cmdbuf, unsigned dep_job_id)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("PANVK_FLUSH_JOBS", false);
+   if (!enabled)
+      return dep_job_id;
+
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, CACHE_FLUSH_JOB);
+
+   if (!job.gpu)
+      return dep_job_id;
+
+   pan_section_pack(job.cpu, CACHE_FLUSH_JOB, PAYLOAD, cfg) {
+      cfg.clean_shader_core_ls = true;
+      cfg.invalidate_shader_core_ls = true;
+      cfg.invalidate_shader_core_other = true;
+      cfg.job_manager_clean = true;
+      cfg.job_manager_invalidate = true;
+      /* Clean the tiler, never invalidate it: these flushes sit between the draws of a batch,
+       * where the tiler holds the polygon lists of every draw tiled so far. */
+      cfg.tiler_clean = true;
+      cfg.tiler_invalidate = false;
+      cfg.l2_clean = true;
+      cfg.l2_invalidate = true;
+   }
+
+   util_dynarray_append(&batch->jobs, job.cpu);
+
+   return pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_CACHE_FLUSH, true, true,
+                         dep_job_id, 0, &job, false);
+}
+
+/*
+ * Queue the geometry shader as a COMPUTE job in the vertex/tiler chain. Returns the job index the
+ * tiler should depend on, or 0 on failure.
+ */
+/*
+ * Tessellation followed by a geometry shader: the tess eval job writes its vertices here instead of
+ * the geometry shader's buffers, one per tessellator index in index order and positions in clip
+ * space, and the geometry shader job reads them as a list of the tessellator's primitives. offsets is the slot -> byte offset
+ * table both use, prims the primitive count the tessellator left.
+ */
+struct tess_gs_io {
+   uint64_t pos, general, index, offsets, prims;
+   uint32_t stride;
+};
+
+static bool
+alloc_tess_gs_io(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_data *draw,
+                 struct tess_gs_io *io)
+{
+   const struct panvk_shader_variant *tes =
+      panvk_shader_only_variant(cmdbuf->state.gfx.tess.tes);
+   const uint32_t cap = tess_index_cap(cmdbuf, draw);
+
+   /* Every generic output of the tess eval shader, 16 bytes each, in slot order. */
+   uint32_t offs[VARYING_SLOT_MAX];
+   uint32_t n = 0;
+   for (unsigned slot = 0; slot < VARYING_SLOT_MAX; slot++)
+      offs[slot] = slot >= VARYING_SLOT_VAR0 && slot < 64 &&
+                         (tes->gs.outputs_written & BITFIELD64_BIT(slot))
+                      ? 16 * n++
+                      : PANVK_GS_SLOT_UNUSED;
+   io->stride = MAX2(n, 1) * 16;
+
+   struct pan_ptr pos = panvk_cmd_alloc_dev_mem(cmdbuf, desc, cap * 16, 64);
+   struct pan_ptr gen = panvk_cmd_alloc_dev_mem(cmdbuf, desc, cap * io->stride, 64);
+   struct pan_ptr idx = panvk_cmd_alloc_dev_mem(cmdbuf, desc, cap * 4, 4);
+   struct pan_ptr tab = panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(offs), 4);
+   if (!pos.gpu || !gen.gpu || !idx.gpu || !tab.gpu)
+      return false;
+   memcpy(tab.cpu, offs, sizeof(offs));
+
+   io->pos = pos.gpu;
+   io->general = gen.gpu;
+   io->index = idx.gpu;
+   io->offsets = tab.gpu;
+   return true;
+}
+
+/*
+ * The descriptors of a shader the emulation runs as a compute job (geometry, tess control, tess
+ * eval). It was compiled as a compute shader, so it reads the bound GRAPHICS sets the way a
+ * compute shader reads its own: tables filled by a copy job, and set addresses in its compute
+ * sysvals. The job running the shader waits on *copy_job (0 when there is nothing to copy) and
+ * points its DRAW section at *ds. Returns false when an allocation fails.
+ */
+static bool
+emu_prepare_descs(struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader *shader,
+                  struct panvk_compute_sysvals *sysvals, struct panvk_shader_desc_state *ds,
+                  unsigned *copy_job)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
+   const struct panvk_shader_desc_info *info = &shader->desc_info;
+
+   *ds = (struct panvk_shader_desc_state){0};
+   *copy_job = 0;
+
+   if (panvk_per_arch(cmd_prepare_push_descs)(cmdbuf, desc_state, info->used_set_mask) !=
+          VK_SUCCESS ||
+       panvk_per_arch(cmd_prepare_shader_desc_tables)(cmdbuf, desc_state, info, true, ds) !=
+          VK_SUCCESS ||
+       panvk_per_arch(cmd_prepare_dyn_ssbos)(cmdbuf, desc_state, info, ds) != VK_SUCCESS)
+      return false;
+
+   u_foreach_bit(i, info->used_set_mask) {
+      if (i < MAX_SETS && desc_state->sets[i])
+         sysvals->desc.sets[i] = desc_state->sets[i]->descs.dev;
+   }
+   sysvals->desc.sets[PANVK_DESC_TABLE_CS_DYN_SSBOS] = ds->dyn_ssbos;
+
+   struct pan_ptr job;
+   if (panvk_per_arch(meta_get_copy_desc_job)(cmdbuf, info, desc_state, ds, 0, &job) !=
+       VK_SUCCESS)
+      return false;
+   if (job.cpu) {
+      util_dynarray_append(&batch->jobs, job.cpu);
+      *copy_job =
+         pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, false, false, 0, 0, &job, false);
+   }
+   return true;
+}
+
+static unsigned
+emit_gs_job(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
+            unsigned dep_job_id, const struct panvk_shader *gs_shader, uint64_t tess_params,
+            uint64_t tess_count, const struct tess_gs_io *tio)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const struct panvk_shader_variant *gs = panvk_shader_only_variant(gs_shader);
+
+   if (!panvk_priv_mem_check_alloc(gs->rsd))
+      return 0;
+
+   /* After tessellation: one invocation per tessellator primitive (per index for the tess eval
+    * shader), the count at tess_count. With a geometry shader too, tio is where the tess eval
+    * job writes (tes_out) and the geometry shader job reads (tes_in). */
+   const bool tess = tess_count != 0;
+   const bool tes_out = tio && gs_shader == cmdbuf->state.gfx.tess.tes;
+   const bool tes_in = tio && !tes_out;
+   const bool indirect = is_indirect_draw(draw);
+   const uint32_t prims_per_instance = tess       ? tess_index_cap(cmdbuf, draw) /
+                                                       MAX2(gs->gs.input_verts_per_prim, 1)
+                                       : indirect ? 0
+                                                  : gs_prims_per_instance(draw, gs);
+   const uint32_t in_prims = tess       ? prims_per_instance
+                             : indirect ? PANVK_GS_INDIRECT_MAX_PRIMS
+                                        : prims_per_instance * draw->info.instance.count;
+   if (!in_prims)
+      return dep_job_id;
+
+   /* Primitive restart splits strips and fans at index values only the GPU can see: have
+    * panlib_gs_restart_unroll write the primitives out as a list first, and read that the way an
+    * indirect draw is read. prims_per_instance above is the no-restart count, an upper bound. */
+   const bool restart = !tess && draw->info.index.index_size && draw->info.index.restart_enable &&
+                        gs_topology(draw->info.prim) != PANVK_GS_TOPO_LIST;
+   uint64_t unrolled = 0, unrolled_cmd = 0, index_min = draw->index_min_addr;
+   if (restart) {
+      const uint32_t vpp = MAX2(gs->gs.input_verts_per_prim, 1);
+      const uint32_t cap = indirect ? PANVK_GS_INDIRECT_MAX_PRIMS : prims_per_instance;
+      struct pan_ptr scratch =
+         panvk_cmd_alloc_dev_mem(cmdbuf, desc, cap * vpp * 4 + 64, 16);
+      if (!scratch.gpu)
+         return 0;
+
+      /* [0, 20): the draw command in, [32, 52): the one out, [60, 64): a zero minimum for a
+       * direct draw, [64, ...): the list. */
+      uint64_t in_cmd = draw->info.indirect.buffer_dev_addr;
+      if (!indirect) {
+         const VkDrawIndexedIndirectCommand c = {
+            .indexCount = draw->info.vertex.count,
+            .instanceCount = draw->info.instance.count,
+            .firstIndex = draw->info.index.offset,
+            .vertexOffset = draw->info.vertex.base,
+            .firstInstance = draw->info.instance.base,
+         };
+         memcpy(scratch.cpu, &c, sizeof(c));
+         in_cmd = scratch.gpu;
+         index_min = scratch.gpu + 60;
+      }
+      memcpy((uint8_t *)scratch.cpu + 60, &draw->cpu_index_min, 4);
+      unrolled_cmd = scratch.gpu + 32;
+      unrolled = scratch.gpu + 64;
+
+      struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+      const struct panlib_gs_restart_unroll_args args = {
+         .cmd = in_cmd,
+         .ib = draw->info.index.buffer_dev_addr,
+         .out = unrolled,
+         .out_cmd = unrolled_cmd,
+         .index_size = draw->info.index.index_size,
+         .topology = gs_topology(draw->info.prim),
+         .vpp = vpp,
+         .max_prims = cap,
+      };
+      panlib_gs_restart_unroll_struct(&precomp_ctx, panlib_1d_with_jm_deps(1, 0, dep_job_id),
+                                      PANLIB_BARRIER_NONE, args);
+      dep_job_id = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+   }
+
+   /* One invocation per (input primitive, gl_InvocationID) pair. */
+   const uint32_t wg =
+      DIV_ROUND_UP(in_prims * gs->gs.invocations, PANVK_GS_WORKGROUP_SIZE);
+
+   struct panvk_compute_sysvals sysvals = {0};
+   sysvals.num_work_groups.x = wg;
+   sysvals.local_group_size.x = PANVK_GS_WORKGROUP_SIZE;
+   sysvals.gs = (struct panvk_gs_push){
+      .in_pos = tes_in ? tio->pos : cmdbuf->state.gfx.gs.in_pos_override ?: draw->position,
+      .in_general = tes_in ? tio->general : cmdbuf->state.gfx.gs.in_general,
+      .out_pos = tes_out ? tio->pos : cmdbuf->state.gfx.gs.out_pos,
+      .out_general = tes_out ? tio->general : cmdbuf->state.gfx.gs.out_general,
+      .out_index = tes_out ? tio->index : cmdbuf->state.gfx.gs.out_index,
+      .in_offsets = tes_in ? tio->offsets : cmdbuf->state.gfx.gs.in_offsets,
+      .out_offsets = tes_out ? tio->offsets : cmdbuf->state.gfx.gs.out_offsets,
+      .in_general_stride = tes_in ? tio->stride : cmdbuf->state.gfx.gs.in_general_stride,
+      .out_general_stride = tes_out ? tio->stride : cmdbuf->state.gfx.gs.out_general_stride,
+      .num_input_prims = in_prims,
+      .index_buf = restart ? unrolled
+                   : tess || !draw->info.index.index_size ? 0
+                   : indirect ? draw->info.index.buffer_dev_addr
+                              : draw->info.index.buffer_dev_addr +
+                                   (uint64_t)draw->info.index.offset * draw->info.index.index_size,
+      .index_size = restart ? 4 : tess ? 0 : draw->info.index.index_size,
+      .topology = restart || tess ? PANVK_GS_TOPO_LIST : gs_topology(draw->info.prim),
+      .prims_per_instance = prims_per_instance,
+      .instance_stride = !tess && draw->info.instance.count > 1 ? draw->padded_vertex_count : 0,
+      /* The tess eval shader reads the tessellator's output, never the draw's vertices. */
+      .indirect_cmd = restart              ? unrolled_cmd
+                      : indirect && !tess ? draw->info.indirect.buffer_dev_addr
+                                          : 0,
+      .in_pos_desc = indirect || restart
+                        ? draw->varying_bufs + PANVK_VARY_BUF_POSITION * pan_size(ATTRIBUTE_BUFFER)
+                        : 0,
+      .in_general_desc = indirect || restart
+                            ? draw->varying_bufs +
+                                 PANVK_VARY_BUF_GENERAL * pan_size(ATTRIBUTE_BUFFER)
+                            : 0,
+      .vertex_dcd = indirect || restart
+                       ? draw->jobs.vertex.gpu + pan_section_offset(COMPUTE_JOB, DRAW)
+                       : 0,
+      .index_min = index_min,
+      .tiler_index_count = (indirect || restart || tess) && !tes_out && draw->jobs.tiler.gpu
+                              ? draw->jobs.tiler.gpu + pan_section_offset(TILER_JOB, PRIMITIVE) + 12
+                              : 0,
+      .xfb_counts = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_counts,
+      .xfb_staging = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_staging,
+      .xfb_stream_index = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_index,
+      .xfb_stream_slots = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_slots,
+      .xfb_stream_idx = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_stream_idx,
+      .xfb_invocations = tes_out ? 0 : cmdbuf->state.gfx.gs.xfb_invocations,
+      /* The tess eval job leaves clip-space positions for the geometry shader job. */
+      .in_screen_space =
+         !tes_in && !panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader)->gs.vs_clip_space,
+      .out_clip_space = tes_out,
+      .viewports = cmdbuf->state.gfx.gs.viewports,
+      .tess_params = tess_params,
+      .num_prims_addr = tess_count,
+      .polygon_cull =
+         ((cmdbuf->vk.dynamic_graphics_state.rs.cull_mode & VK_CULL_MODE_FRONT_BIT)
+             ? PANVK_GS_CULL_FRONT : 0) |
+         ((cmdbuf->vk.dynamic_graphics_state.rs.cull_mode & VK_CULL_MODE_BACK_BIT)
+             ? PANVK_GS_CULL_BACK : 0) |
+         (cmdbuf->vk.dynamic_graphics_state.rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE
+             ? PANVK_GS_FRONT_CCW : 0),
+      /* The vertex shader's viewport transform, so the emulation can undo it on the way in and
+       * re-apply it on the way out. Set by prepare_draw, which has already run. */
+      .viewport_scale = {cmdbuf->state.gfx.sysvals.viewport.scale.x,
+                         cmdbuf->state.gfx.sysvals.viewport.scale.y,
+                         cmdbuf->state.gfx.sysvals.viewport.scale.z},
+      .viewport_offset = {cmdbuf->state.gfx.sysvals.viewport.offset.x,
+                          cmdbuf->state.gfx.sysvals.viewport.offset.y,
+                          cmdbuf->state.gfx.sysvals.viewport.offset.z},
+   };
+
+   struct panvk_shader_desc_state ds;
+   unsigned copy_job;
+   if (!emu_prepare_descs(cmdbuf, gs_shader, &sysvals, &ds, &copy_job))
+      return 0;
+
+   struct pan_ptr push_uniforms;
+   if (panvk_per_arch(cmd_prepare_gs_push_uniforms)(cmdbuf, gs, &sysvals,
+                                                    &push_uniforms) != VK_SUCCESS)
+      return 0;
+
+   struct pan_compute_dim dim = {wg, 1, 1};
+   uint64_t tls = panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, gs, &dim, false);
+   if (!tls)
+      return 0;
+
+   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
+   if (!job.gpu)
+      return 0;
+
+   pan_pack_work_groups_compute(
+      pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), wg, 1, 1,
+      PANVK_GS_WORKGROUP_SIZE, 1, 1, false, false);
+
+   pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = util_logbase2_ceil(PANVK_GS_WORKGROUP_SIZE + 1) + 2;
+   }
+
+   pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = panvk_priv_mem_dev_addr(gs->rsd);
+      cfg.attributes = ds.img_attrib_table;
+      cfg.attribute_buffers = ds.tables[PANVK_BIFROST_DESC_TABLE_IMG];
+      cfg.uniform_buffers = ds.tables[PANVK_BIFROST_DESC_TABLE_UBO];
+      cfg.textures = ds.tables[PANVK_BIFROST_DESC_TABLE_TEXTURE];
+      cfg.samplers = ds.tables[PANVK_BIFROST_DESC_TABLE_SAMPLER];
+      cfg.push_uniforms = push_uniforms.gpu;
+      cfg.thread_storage = tls;
+   }
+
+   util_dynarray_append(&batch->jobs, job.cpu);
+
+   /* barrier, because a job dependency orders execution but does not make the vertex job's
+    * varying writes VISIBLE to this one: the vertex shader reaches the varying buffers through
+    * the varying unit, and reading them from a compute job without a barrier returned zeros
+    * even though the address arithmetic was verified correct. suppress_prefetch, because the
+    * tiler descriptor after it is only valid once this has run. */
+   return pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, true, true,
+                         dep_job_id, copy_job, &job, false);
+}
+
+/*
+ * Tessellation, between the vertex job (dep_job_id) and the tess eval job:
+ *
+ *   tess control      compute, one workgroup per patch, one invocation per output vertex
+ *   panlib_tess_*     COUNT: indices per patch
+ *   prefix_sum        offsets, the index buffer, the total at *count_out
+ *   panlib_tess_*     WITH_COUNTS: domain points and indices
+ *
+ * Returns the job the tess eval job waits on, 0 on failure.
+ */
+static unsigned
+emit_tess_jobs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
+               unsigned dep_job_id, uint64_t *params_out, uint64_t *count_out)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const struct panvk_shader_variant *tcs =
+      panvk_shader_only_variant(cmdbuf->state.gfx.tess.tcs);
+   const struct vk_dynamic_graphics_state *dyn = &cmdbuf->vk.dynamic_graphics_state;
+
+   if (!panvk_priv_mem_check_alloc(tcs->rsd) || !dev->tess_heap)
+      return 0;
+
+   /* An indirect draw sizes the patch arrays and the tess control grid on the GPU
+    * (panlib_tess_setup_indirect): nothing below that depends on the patch count is used. */
+   const bool indirect = is_indirect_draw(draw);
+   const uint32_t pcp = MAX2(dyn->ts.patch_control_points, 1);
+   const uint32_t ppi = indirect ? 1 : draw->info.vertex.count / pcp;
+   const uint32_t instances = indirect ? 1 : draw->info.instance.count;
+   const uint32_t nr_patches = indirect ? 0 : ppi * instances;
+   const uint32_t local = MAX2(tcs->gs.tcs_vertices_out, 1);
+   const uint32_t tcs_stride_el = tcs->gs.tcs_output_stride / 4;
+
+   /* The batch's heap header. The first tessellated draw of every batch rewinds it on the GPU
+    * (prefix_sum), which also covers a command buffer submitted again. */
+   const bool reset_heap = !batch->tess_heap;
+   /* kbase: the tessellation heap is the device's, one batch's at a time. */
+   batch->order |= PANVK_BATCH_WAIT_FRAG | PANVK_BATCH_HOLD_FRAG;
+   if (!batch->tess_heap) {
+      struct pan_ptr h = panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(struct poly_heap), 16);
+      if (!h.gpu)
+         return 0;
+      struct poly_heap *heap = h.cpu;
+      heap->base = dev->tess_heap->addr.dev;
+      heap->bottom = 0;
+      heap->size = PANVK_TESS_HEAP_SIZE;
+      batch->tess_heap = h.gpu;
+   }
+
+   uint32_t size = nr_patches * tcs_stride_el * 4;
+   const uint32_t coord_off = ALIGN_POT(size, 16);
+   size = coord_off + nr_patches * 4;
+   const uint32_t counts_off = ALIGN_POT(size, 16);
+   size = counts_off + nr_patches * 4;
+   const uint32_t draws_off = ALIGN_POT(size, 16);
+   size = draws_off + 32;
+   const uint32_t out_off = size;
+   size += 16;
+   const uint32_t params_off = ALIGN_POT(size, 16);
+   size = params_off + sizeof(struct poly_tess_params);
+
+   struct pan_ptr blob = panvk_cmd_alloc_dev_mem(cmdbuf, desc, size, 64);
+   if (!blob.gpu)
+      return 0;
+
+   enum tess_primitive_mode prim;
+   enum gl_tess_spacing spacing;
+   bool ccw, points;
+   tess_mode(cmdbuf, &prim, &spacing, &ccw, &points);
+
+   struct poly_tess_params *p = (struct poly_tess_params *)((uint8_t *)blob.cpu + params_off);
+   *p = (struct poly_tess_params){
+      .heap = batch->tess_heap,
+      .patch_coord_buffer = dev->tess_heap->addr.dev,
+      .coord_allocs = blob.gpu + coord_off,
+      .out_draws = blob.gpu + draws_off,
+      .tcs_buffer = blob.gpu,
+      .counts = blob.gpu + counts_off,
+      .tcs_per_vertex_outputs = tcs->gs.tcs_per_vertex_outputs,
+      .input_patch_size = pcp,
+      .output_patch_size = tcs->gs.tcs_vertices_out,
+      .tcs_patch_constants = tcs->gs.tcs_nr_patch_outputs,
+      .patches_per_instance = ppi,
+      .tcs_stride_el = tcs_stride_el,
+      .nr_patches = nr_patches,
+      .partitioning = spacing == TESS_SPACING_EQUAL ? POLY_TESS_PARTITIONING_INTEGER
+                      : spacing == TESS_SPACING_FRACTIONAL_ODD
+                         ? POLY_TESS_PARTITIONING_FRACTIONAL_ODD
+                         : POLY_TESS_PARTITIONING_FRACTIONAL_EVEN,
+      .points_mode = points,
+      .isolines = prim == TESS_PRIMITIVE_ISOLINES,
+   };
+   if (!points && prim != TESS_PRIMITIVE_ISOLINES)
+      p->ccw = ccw ^ (dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT);
+
+   const uint64_t params = blob.gpu + params_off;
+   const uint64_t out = blob.gpu + out_off;
+
+   /* The tess control job. */
+   struct panvk_compute_sysvals sysvals = {0};
+   sysvals.num_work_groups.x = ppi;
+   sysvals.num_work_groups.y = instances;
+   sysvals.num_work_groups.z = 1;
+   sysvals.local_group_size.x = local;
+   sysvals.local_group_size.y = 1;
+   sysvals.local_group_size.z = 1;
+   sysvals.gs = (struct panvk_gs_push){
+      .in_pos = draw->position,
+      .in_general = cmdbuf->state.gfx.gs.in_general,
+      .in_offsets = cmdbuf->state.gfx.gs.in_offsets,
+      .in_general_stride = cmdbuf->state.gfx.gs.in_general_stride,
+      .index_buf = !draw->info.index.index_size ? 0
+                   : indirect                   ? draw->info.index.buffer_dev_addr
+                                                : draw->info.index.buffer_dev_addr +
+                                                     (uint64_t)draw->info.index.offset *
+                                                        draw->info.index.index_size,
+      .index_size = draw->info.index.index_size,
+      .indirect_cmd = indirect ? draw->info.indirect.buffer_dev_addr : 0,
+      .in_pos_desc =
+         indirect ? draw->varying_bufs + PANVK_VARY_BUF_POSITION * pan_size(ATTRIBUTE_BUFFER) : 0,
+      .in_general_desc =
+         indirect ? draw->varying_bufs + PANVK_VARY_BUF_GENERAL * pan_size(ATTRIBUTE_BUFFER) : 0,
+      .vertex_dcd = indirect ? draw->jobs.vertex.gpu + pan_section_offset(COMPUTE_JOB, DRAW) : 0,
+      .index_min = draw->index_min_addr,
+      .prims_per_instance = ppi,
+      .instance_stride = instances > 1 ? draw->padded_vertex_count : 0,
+      .in_screen_space =
+         !panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader)->gs.vs_clip_space,
+      .viewport_scale = {cmdbuf->state.gfx.sysvals.viewport.scale.x,
+                         cmdbuf->state.gfx.sysvals.viewport.scale.y,
+                         cmdbuf->state.gfx.sysvals.viewport.scale.z},
+      .viewport_offset = {cmdbuf->state.gfx.sysvals.viewport.offset.x,
+                          cmdbuf->state.gfx.sysvals.viewport.offset.y,
+                          cmdbuf->state.gfx.sysvals.viewport.offset.z},
+      .tess_params = params,
+      .patch_size = pcp,
+   };
+
+   struct panvk_shader_desc_state ds;
+   unsigned copy_job;
+   if (!emu_prepare_descs(cmdbuf, cmdbuf->state.gfx.tess.tcs, &sysvals, &ds, &copy_job))
+      return 0;
+
+   struct pan_ptr push_uniforms;
+   if (panvk_per_arch(cmd_prepare_gs_push_uniforms)(cmdbuf, tcs, &sysvals,
+                                                    &push_uniforms) != VK_SUCCESS)
+      return 0;
+
+   struct pan_compute_dim dim = {ppi, instances, 1};
+   uint64_t tls = panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, tcs, &dim, indirect);
+   if (!tls)
+      return 0;
+
+   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, COMPUTE_JOB);
+   if (!job.gpu)
+      return 0;
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   if (indirect) {
+      /* The sysvals the grid feeds, or the memory sink. */
+      uint64_t nwg[2] = {0x8ull << 60, 0x8ull << 60};
+      if (shader_uses_sysval(tcs, compute, num_work_groups.x))
+         nwg[0] = push_uniforms.gpu +
+                  shader_remapped_sysval_offset(tcs, sysval_offset(compute, num_work_groups.x));
+      if (shader_uses_sysval(tcs, compute, num_work_groups.y))
+         nwg[1] = push_uniforms.gpu +
+                  shader_remapped_sysval_offset(tcs, sysval_offset(compute, num_work_groups.y));
+
+      const struct panlib_tess_setup_indirect_args a = {
+         .p = blob.gpu + params_off,
+         .cmd = draw->info.indirect.buffer_dev_addr,
+         .reset_heap = reset_heap,
+         .tcs_job = job.gpu,
+         .tcs_local = local,
+         .num_wg_x = nwg[0],
+         .num_wg_y = nwg[1],
+      };
+      /* suppress_prefetch: the tess control job after it is only valid once this has run. */
+      panlib_tess_setup_indirect_struct(
+         &precomp_ctx, panlib_1d_with_jm_deps(1, 0, dep_job_id),
+         PANLIB_BARRIER_JM_BARRIER | PANLIB_BARRIER_JM_SUPPRESS_PREFETCH, a);
+      dep_job_id = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+   }
+
+   pan_pack_work_groups_compute(pan_section_ptr(job.cpu, COMPUTE_JOB, INVOCATION), ppi,
+                                instances, 1, local, 1, 1, false, false);
+
+   pan_section_pack(job.cpu, COMPUTE_JOB, PARAMETERS, cfg) {
+      cfg.job_task_split = util_logbase2_ceil(local + 1) + util_logbase2_ceil(1 + 1) +
+                           util_logbase2_ceil(1 + 1);
+   }
+
+   pan_section_pack(job.cpu, COMPUTE_JOB, DRAW, cfg) {
+      cfg.state = panvk_priv_mem_dev_addr(tcs->rsd);
+      cfg.attributes = ds.img_attrib_table;
+      cfg.attribute_buffers = ds.tables[PANVK_BIFROST_DESC_TABLE_IMG];
+      cfg.uniform_buffers = ds.tables[PANVK_BIFROST_DESC_TABLE_UBO];
+      cfg.textures = ds.tables[PANVK_BIFROST_DESC_TABLE_TEXTURE];
+      cfg.samplers = ds.tables[PANVK_BIFROST_DESC_TABLE_SAMPLER];
+      cfg.push_uniforms = push_uniforms.gpu;
+      cfg.thread_storage = tls;
+   }
+
+   util_dynarray_append(&batch->jobs, job.cpu);
+   /* NOT_STARTED for an indirect draw: panlib_tess_setup_indirect merges the real type in. */
+   unsigned dep = pan_jc_add_job(&batch->vtc_jc,
+                                 indirect ? MALI_JOB_TYPE_NOT_STARTED : MALI_JOB_TYPE_COMPUTE,
+                                 true, indirect, dep_job_id, copy_job, &job, false);
+   dep = emit_cache_flush_job(cmdbuf, dep);
+
+   /* The tessellator. */
+   const uint32_t tess_grid = indirect ? PANVK_TESS_INDIRECT_GRID : nr_patches;
+   for (unsigned pass = 0; pass < 2; pass++) {
+      const uint32_t mode = pass == 0 ? POLY_TESS_MODE_COUNT : POLY_TESS_MODE_WITH_COUNTS;
+      const struct panlib_precomp_grid grid = panlib_1d_with_jm_deps(tess_grid, 0, dep);
+      if (prim == TESS_PRIMITIVE_ISOLINES) {
+         const struct panlib_tess_isoline_args a = {.p = params, .mode = mode};
+         panlib_tess_isoline_struct(&precomp_ctx, grid, PANLIB_BARRIER_JM_BARRIER, a);
+      } else if (prim == TESS_PRIMITIVE_QUADS) {
+         const struct panlib_tess_quad_args a = {.p = params, .mode = mode};
+         panlib_tess_quad_struct(&precomp_ctx, grid, PANLIB_BARRIER_JM_BARRIER, a);
+      } else {
+         const struct panlib_tess_tri_args a = {.p = params, .mode = mode};
+         panlib_tess_tri_struct(&precomp_ctx, grid, PANLIB_BARRIER_JM_BARRIER, a);
+      }
+      dep = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+
+      if (pass == 0) {
+         const struct panlib_tess_prefix_sum_args a = {
+            .p = params,
+            .reset_heap = reset_heap && !indirect,
+            .out = out,
+         };
+         panlib_tess_prefix_sum_struct(&precomp_ctx, panlib_1d_with_jm_deps(1, 0, dep),
+                                       PANLIB_BARRIER_JM_BARRIER, a);
+         dep = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+      }
+   }
+
+   *params_out = params;
+   *count_out = out;
+   return dep;
+}
+
+/*
+ * The compute jobs between the vertex job (dep_job_id) and the tiler: tessellation, then the tess
+ * eval shader and the geometry shader through the emulation. Returns the job the tiler waits on,
+ * 0 on failure.
+ */
+static unsigned
+emit_emulation_jobs(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
+                    unsigned dep_job_id)
+{
+   const struct panvk_shader *tes = cmdbuf->state.gfx.tess.tes;
+   const struct panvk_shader *gs = cmdbuf->state.gfx.gs.shader;
+   unsigned dep = emit_cache_flush_job(cmdbuf, dep_job_id);
+   uint64_t tess_params = 0, tess_count = 0;
+
+   if (tes) {
+      dep = emit_tess_jobs(cmdbuf, draw, dep, &tess_params, &tess_count);
+      if (!dep)
+         return 0;
+   }
+
+   if (tes && gs != tes) {
+      struct tess_gs_io io;
+      if (!alloc_tess_gs_io(cmdbuf, draw, &io))
+         return 0;
+      /* The tessellator's primitive count, next to its index count (panlib_tess_prefix_sum). */
+      io.prims = tess_count + 8;
+      dep = emit_gs_job(cmdbuf, draw, dep, tes, tess_params, tess_count, &io);
+      if (!dep)
+         return 0;
+      dep = emit_cache_flush_job(cmdbuf, dep);
+      return emit_gs_job(cmdbuf, draw, dep, gs, 0, io.prims, &io);
+   }
+
+   return emit_gs_job(cmdbuf, draw, dep, gs, tess_params, tess_count, NULL);
+}
+
+/*
+ * Transform feedback for a draw whose geometry shader emulation just ran (dep_job_id: the flush
+ * after it). panlib_xfb_scan puts the primitives in draw order and fits them into the buffers,
+ * panlib_xfb_copy moves the records. The capture jobs of a batch are chained through
+ * xfb.last_job, and each draw reads the write offsets the previous one left in its own slot, so no
+ * job ever reads memory a later one writes.
+ */
+static void
+emit_xfb_jobs(struct panvk_cmd_buffer *cmdbuf, unsigned dep_job_id)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+   const struct panvk_shader_variant *gs =
+      panvk_shader_only_variant(cmdbuf->state.gfx.gs.shader);
+   const uint32_t n = cmdbuf->state.gfx.gs.xfb_invocations;
+   const uint32_t k_dw = gs->gs.xfb_dwords;
+   /* The tess eval shader emits one point per tessellator index: every `group` consecutive
+    * invocations are one of the tessellator's primitives, captured as such with the count of
+    * its first invocation. */
+   uint32_t group = 0;
+   if (cmdbuf->state.gfx.gs.shader == cmdbuf->state.gfx.tess.tes) {
+      enum tess_primitive_mode prim;
+      enum gl_tess_spacing spacing;
+      bool ccw, points;
+      tess_mode(cmdbuf, &prim, &spacing, &ccw, &points);
+      group = points ? 1 : prim == TESS_PRIMITIVE_ISOLINES ? 2 : 3;
+   }
+   const uint32_t vpp = group ? group : gs->gs.output_verts_per_prim;
+   const uint32_t idx_per_invocation =
+      group ? group : gs->gs.max_output_prims * gs->gs.output_verts_per_prim;
+
+   /* One scan and copy per vertex stream, each over the buffers that stream captures to (the
+    * others get stride 0, which both kernels skip), in stream order and chained through the
+    * write offsets, like consecutive draws. */
+   u_foreach_bit(s, gs->gs.stream_mask) {
+      bool captures = false;
+      for (unsigned b = 0; b < 4; b++)
+         captures |= gs->gs.xfb_strides[b] && gs->gs.xfb_buffer_stream[b] == s;
+      if (!captures)
+         continue;
+
+      /* [draw block][16: offsets after this draw][k_dw: table][n: first primitive per
+       * invocation] */
+      struct pan_ptr mem = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc, sizeof(struct libpan_xfb_draw) + 16 + (k_dw + n) * 4, 16);
+      if (!mem.gpu)
+         return;
+
+      const uint64_t slot = mem.gpu + sizeof(struct libpan_xfb_draw);
+      const uint64_t table = slot + 16;
+      struct libpan_xfb_draw *d = mem.cpu;
+      *d = (struct libpan_xfb_draw){
+         .offsets_in = cmdbuf->state.gfx.xfb.offsets,
+         .offsets_out = slot,
+         .counts = cmdbuf->state.gfx.gs.xfb_counts + (uint64_t)s * n * 4,
+         .first = table + k_dw * 4,
+         .indices = s ? cmdbuf->state.gfx.gs.xfb_stream_index +
+                           (uint64_t)(s - 1) * cmdbuf->state.gfx.gs.xfb_stream_idx * 4
+                      : cmdbuf->state.gfx.gs.out_index,
+         .staging = cmdbuf->state.gfx.gs.xfb_staging,
+         .table = table,
+         .invocations = group ? n / group : n,
+         .idx_per_invocation = idx_per_invocation,
+         .vpp = vpp,
+         .record_dwords = k_dw,
+         .count_stride = group,
+         .stats = cmdbuf->state.gfx.xfb.query_stats[s],
+      };
+      for (unsigned b = 0; b < 4; b++) {
+         d->buffer[b] = cmdbuf->state.gfx.xfb.addr[b];
+         d->size[b] = cmdbuf->state.gfx.xfb.size[b];
+         d->stride[b] = gs->gs.xfb_buffer_stream[b] == s ? gs->gs.xfb_strides[b] : 0;
+      }
+      memcpy((uint8_t *)mem.cpu + sizeof(struct libpan_xfb_draw) + 16, gs->gs.xfb_table,
+             k_dw * 4);
+      cmdbuf->state.gfx.xfb.offsets = slot;
+
+      struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+      const struct panlib_xfb_scan_args scan = {.d = mem.gpu};
+      panlib_xfb_scan_struct(&precomp_ctx,
+                             panlib_1d_with_jm_deps(1, dep_job_id, cmdbuf->state.gfx.xfb.last_job),
+                             PANLIB_BARRIER_JM_BARRIER, scan);
+      const unsigned scanned = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+
+      const struct panlib_xfb_copy_args copy = {.d = mem.gpu};
+      panlib_xfb_copy_struct(&precomp_ctx,
+                             panlib_1d_with_jm_deps(DIV_ROUND_UP(n, 64), scanned, 0),
+                             PANLIB_BARRIER_JM_BARRIER, copy);
+      cmdbuf->state.gfx.xfb.last_job = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+   }
+}
+
+/*
+ * The geometry shader this draw runs: the application's, or, with none bound, the internal one
+ * that draws triangles as lines or points for VK_POLYGON_MODE_LINE/POINT (the tiler only fills).
+ * Switching marks the shader dirty, which relinks the varyings against it.
+ */
+static void
+panvk_select_gs(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_data *draw)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   const struct vk_rasterization_state *rs = &cmdbuf->vk.dynamic_graphics_state.rs;
+   /* The shader whose output the tiler draws: the application's geometry shader, else the tess
+    * eval shader, which runs through the same emulation. */
+   const struct panvk_shader *gs =
+      cmdbuf->state.gfx.gs.app_shader ? cmdbuf->state.gfx.gs.app_shader : cmdbuf->state.gfx.tess.tes;
+
+   const bool polygon_mode =
+      rs->polygon_mode != VK_POLYGON_MODE_FILL && !rs->rasterizer_discard_enable &&
+      (draw->info.prim == MESA_PRIM_TRIANGLES || draw->info.prim == MESA_PRIM_TRIANGLE_STRIP ||
+       draw->info.prim == MESA_PRIM_TRIANGLE_FAN);
+   /* A vertex shader with transform feedback outputs and nothing after it is compiled for the
+    * emulation and captures through the pass-through shader. Polygon mode takes over while
+    * nothing is capturing (both read the clip-space output). */
+   const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
+   if (!gs && vs->gs.vs_xfb_size && (cmdbuf->state.gfx.xfb.active || !polygon_mode))
+      gs = panvk_per_arch(xfb_passthrough_gs)(dev, vs, draw->info.prim);
+
+   if (!gs && polygon_mode)
+      gs = panvk_per_arch(polygon_mode_gs)(dev, rs->polygon_mode == VK_POLYGON_MODE_POINT);
+
+   if (cmdbuf->state.gfx.gs.shader != gs) {
+      cmdbuf->state.gfx.gs.shader = gs;
+      gfx_state_set_dirty(cmdbuf, GS);
+      gfx_state_set_dirty(cmdbuf, GS_PUSH_UNIFORMS);
+   }
 }
 
 static void
@@ -1415,10 +2582,19 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
    if (!panvk_priv_mem_check_alloc(vs->rsd))
       return;
 
+   /* Tessellation needs both stages, and a draw with no whole patch draws nothing. */
+   if (cmdbuf->state.gfx.tess.tes &&
+       (!cmdbuf->state.gfx.tess.tcs || !tess_patches(cmdbuf, draw)))
+      return;
+
+   panvk_stats_add_draw(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state, &draw->info);
+
    /* Needs to be done before get_fs() is called because it depends on
     * fs.required being initialized. */
    cmdbuf->state.gfx.fs.required =
       fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
+
+   panvk_select_gs(cmdbuf, draw);
 
    result = prepare_draw(cmdbuf, draw);
    if (result != VK_SUCCESS)
@@ -1458,6 +2634,7 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
          return;
 
       if (vs->info.vs.idvs) {
+         panvk_per_arch(cmd_flush_pending_tilers)(cmdbuf, 0);
          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
                         false, 0, copy_desc_job_id, &draw->jobs.idvs, false);
       } else {
@@ -1465,14 +2642,106 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
             pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false, false,
                            0, copy_desc_job_id, &draw->jobs.vertex, false);
 
-         if (draw->jobs.tiler.gpu != 0) {
-            pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_TILER, false, false,
-                           vjob_id, 0, &draw->jobs.tiler, false);
+         /* Geometry shader emulation: a compute job between the vertex job and the tiler job,
+          * turning the vertices the vertex shader just wrote into the ones the tiler will read.
+          * The tiler waits on it rather than on the vertex job. */
+         unsigned gs_job_id = vjob_id;
+         if (draw->gs_varying_bufs && (!cmdbuf->state.gfx.gs.cpufill ||
+                                       cmdbuf->state.gfx.gs.keepjob)) {
+            gs_job_id = emit_emulation_jobs(cmdbuf, draw, vjob_id);
+            if (!gs_job_id)
+               return;
+            /* The tiler reads the emulation's output. Measured on Mali-G72: without this the
+             * tiler read an index buffer the GS job had written but not yet published, and drew
+             * only the primitives whose indices happened to have landed. */
+            gs_job_id = emit_cache_flush_job(cmdbuf, gs_job_id);
+            if (cmdbuf->state.gfx.gs.xfb_counts)
+               emit_xfb_jobs(cmdbuf, gs_job_id);
+         }
+
+         /* Behind the next draws' vertex jobs (panvk_per_arch(cmd_flush_pending_tilers)),
+          * unless the tiler waits on emulation jobs. */
+         if (draw->jobs.tiler.gpu != 0 && gs_job_id == vjob_id) {
+            panvk_per_arch(cmd_flush_pending_tilers)(cmdbuf, PANVK_TILER_LAG - 1);
+            cmdbuf->state.pending_tilers[cmdbuf->state.pending_tiler_count++] =
+               (struct panvk_pending_tiler){.job = draw->jobs.tiler, .dep = gs_job_id};
+         } else {
+            panvk_per_arch(cmd_flush_pending_tilers)(cmdbuf, 0);
+            if (draw->jobs.tiler.gpu != 0) {
+               pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_TILER, false, false,
+                              gs_job_id, 0, &draw->jobs.tiler, false);
+            }
          }
       }
    }
 
    clear_dirty_after_draw(cmdbuf);
+}
+
+/* The batch's index scan and patch jobs (see panlib_draw_batch_patch), queued at its first
+ * indirect draw so they sit ahead of every draw that waits on them in the job chain; the draws
+ * are handed over at the batch's close. Returns the job the draws' vertex jobs wait on. */
+#define PANVK_DRAW_BATCH_SCAN_GROUPS 64
+#define PANVK_DRAW_BATCH_PATCH_GROUPS 4
+
+static unsigned
+draw_helper_ready_job(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+
+   if (batch->draw_helper.hdr.gpu)
+      return batch->draw_helper.ready_job;
+
+   struct pan_ptr hdr =
+      panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(struct libpan_draw_batch), 8);
+   if (!hdr.gpu)
+      return 0;
+   memset(hdr.cpu, 0, sizeof(struct libpan_draw_batch));
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   const struct panlib_draw_batch_minmax_args scan = {.batch = hdr.gpu};
+   const struct panlib_draw_batch_patch_args patch = {.batch = hdr.gpu};
+
+   panlib_draw_batch_minmax_struct(&precomp_ctx,
+                                   panlib_1d_with_jm_deps(PANVK_DRAW_BATCH_SCAN_GROUPS, 0, 0),
+                                   PANLIB_BARRIER_NONE, scan);
+   /* The patch reads what the scan wrote. */
+   const unsigned scan_job = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+   panlib_draw_batch_patch_struct(&precomp_ctx,
+                                  panlib_1d_with_jm_deps(PANVK_DRAW_BATCH_PATCH_GROUPS, 0,
+                                                         scan_job),
+                                  PANLIB_BARRIER_JM_SUPPRESS_PREFETCH, patch);
+
+   /* The helper patches the vertex and tiler descriptors on the GPU, and a job dependency alone
+    * does not make its stores visible to the jobs that read them: measured on Mali-G72, the
+    * vertex job fetched the descriptors as the CPU had written them (varying buffers of size
+    * 0, so every position store was dropped), and the patched values only reached memory
+    * later. Clean and invalidate between the helper and the draws. */
+   batch->draw_helper.ready_job = emit_cache_flush_job(cmdbuf, batch->vtc_jc.job_index);
+   batch->draw_helper.hdr = hdr;
+   return batch->draw_helper.ready_job;
+}
+
+void
+panvk_per_arch(cmd_finish_draw_helper)(struct panvk_cmd_buffer *cmdbuf,
+                                       struct panvk_batch *batch)
+{
+   struct libpan_draw_batch *hdr = batch->draw_helper.hdr.cpu;
+   const unsigned n = util_dynarray_num_elements(&batch->draw_helper.entries,
+                                                 struct libpan_draw_batch_entry);
+
+   if (hdr && n) {
+      const size_t size = n * sizeof(struct libpan_draw_batch_entry);
+      struct pan_ptr entries = panvk_cmd_alloc_dev_mem(cmdbuf, desc, size, 8);
+      if (entries.gpu) {
+         memcpy(entries.cpu, util_dynarray_begin(&batch->draw_helper.entries), size);
+         hdr->entries = entries.gpu;
+         hdr->count = n;
+      }
+   }
+
+   util_dynarray_fini(&batch->draw_helper.entries);
+   memset(&batch->draw_helper, 0, sizeof(batch->draw_helper));
 }
 
 static void
@@ -1487,10 +2756,23 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    if (!panvk_priv_mem_check_alloc(vs->rsd))
       return;
 
+   /* Tessellation needs both stages. */
+   if (cmdbuf->state.gfx.tess.tes && !cmdbuf->state.gfx.tess.tcs)
+      return;
+
+   /* The draw helper patches the sysvals in the vertex push uniforms: they get their own copy,
+    * which no later draw reuses (reset below). */
+   gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+
+   if (cmdbuf->cur_batch)
+      panvk_per_arch(cmd_flush_pending_tilers)(cmdbuf, 0);
+
    /* Needs to be done before get_fs() is called because it depends on
     * fs.required being initialized. */
    cmdbuf->state.gfx.fs.required =
       fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
+
+   panvk_select_gs(cmdbuf, draw);
 
    result = prepare_draw(cmdbuf, draw);
    if (result != VK_SUCCESS)
@@ -1500,10 +2782,20 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    const struct vk_vertex_input_state *vi =
       cmdbuf->vk.dynamic_graphics_state.vi;
 
-   unsigned init_heap_job_id;
-   result = panvk_per_arch(cmd_init_poly_heap)(cmdbuf, &init_heap_job_id);
-   if (result != VK_SUCCESS)
-      return;
+   /* kbase: the varyings go to the device's poly heap, which every command buffer's indirect
+    * draws fill from the start, and the fragment jobs read them from there. */
+   batch->order |= PANVK_BATCH_WAIT_FRAG | PANVK_BATCH_HOLD_FRAG;
+
+   if (!cmdbuf->state.indirect_heap) {
+      struct pan_ptr h = panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(struct poly_heap), 8);
+      if (!h.gpu)
+         return;
+      *(struct poly_heap *)h.cpu = (struct poly_heap){
+         .base = dev->poly_heap.buffer->addr.dev,
+         .size = PANVK_POLY_HEAP_SIZE,
+      };
+      cmdbuf->state.indirect_heap = h.gpu;
+   }
 
    unsigned copy_desc_job_id =
       draw->jobs.vertex_copy_desc.gpu
@@ -1526,57 +2818,9 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
                                      ? util_bitcount(view_mask)
                                      : cmdbuf->state.gfx.render.layer_count;
 
-   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
-   uint64_t index_min_max_res_ptr = 0;
-   uint32_t job_before_indirect_helper = copy_desc_job_id;
-   if (draw->info.index.index_size) {
-      index_min_max_res_ptr =
-         panvk_cmd_alloc_dev_mem(
-            cmdbuf, desc,
-            sizeof(struct libpan_draw_helper_index_min_max_result), 8)
-            .gpu;
-      const struct panlib_draw_index_minmax_search_helper_args args = {
-         .index_buffer_ptr = draw->info.index.buffer_dev_addr,
-         .cmd = draw->info.indirect.buffer_dev_addr,
-         .min_ptr =
-            index_min_max_res_ptr +
-            offsetof(struct libpan_draw_helper_index_min_max_result, min),
-         .max_ptr =
-            index_min_max_res_ptr +
-            offsetof(struct libpan_draw_helper_index_min_max_result, max),
-      };
-
-      struct libpan_draw_helper_index_min_max_result val = {
-         .min = ((uint64_t)1 << (draw->info.index.index_size * 8)) - 1,
-         .max = 0,
-      };
-      uint64_t *raw_val = (uint64_t *)&val;
-
-      struct pan_ptr write_job =
-         pan_pool_alloc_desc(&cmdbuf->desc_pool.base, WRITE_VALUE_JOB);
-
-      pan_section_pack(write_job.cpu, WRITE_VALUE_JOB, PAYLOAD, payload) {
-         payload.type = MALI_WRITE_VALUE_TYPE_IMMEDIATE_64;
-         payload.address = index_min_max_res_ptr;
-         payload.immediate_value = *raw_val;
-      };
-
-      unsigned write_job_id =
-         pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, false, false,
-                        0, copy_desc_job_id, &write_job, false);
-      util_dynarray_append(&batch->jobs, write_job.cpu);
-
-      const uint32_t index_count =
-         draw->info.index.buffer_size / draw->info.index.index_size;
-      uint32_t wg_count = DIV_ROUND_UP(index_count, 65536);
-      assert(wg_count <= 65536);
-
-      panlib_draw_index_minmax_search_helper_struct(
-         &precomp_ctx, panlib_1d_with_jm_deps(wg_count, 0, write_job_id),
-         PANLIB_BARRIER_NONE, args, util_logbase2(draw->info.index.index_size),
-         draw->info.index.restart_enable);
-      job_before_indirect_helper = batch->vtc_jc.job_index;
-   }
+   const unsigned ready_job = draw_helper_ready_job(cmdbuf);
+   if (!ready_job)
+      return;
 
    for (uint32_t i = 0; i < enabled_layer_count; i++) {
       const uint32_t layer = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
@@ -1588,105 +2832,85 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
       if (result != VK_SUCCESS)
          return;
 
-      assert(draw->info.indirect.buffer_dev_addr != 0 ||
-             draw->info.index.index_size);
+      assert(draw->info.indirect.buffer_dev_addr != 0);
 
-      uint32_t attrib_bufs_valid = vi->bindings_valid;
-      uint32_t attribs_valid = vi->attributes_valid;
-      uint64_t first_vertex_sysval = 0x8ull << 60;
-      uint64_t first_instance_sysval = 0x8ull << 60;
-      uint64_t raw_vertex_offset_sysval = 0x8ull << 60;
+      struct libpan_draw_batch_entry e = {
+         .cmd = draw->info.indirect.buffer_dev_addr,
+         .index_buffer_ptr = draw->info.index.buffer_dev_addr,
+         .varying_bufs_descs = draw->varying_bufs,
+         .heap = cmdbuf->state.indirect_heap,
+         .attrib_bufs_descs = draw->vs.attribute_bufs,
+         .attrib_bufs_infos = draw->indirect_info.attrib_bufs,
+         .attribs_descs = draw->vs.attributes,
+         .attribs_infos = draw->indirect_info.attribs,
+         .idvs_job = vs->info.vs.idvs ? draw->jobs.idvs.gpu : 0,
+         .vertex_job = draw->jobs.vertex.gpu,
+         /* With a geometry shader the tiler draws what the emulation wrote, set up on the CPU. */
+         .tiler_job = draw->gs_varying_bufs ? 0 : draw->jobs.tiler.gpu,
+         .index_size = draw->info.index.index_size,
+         .primitive_restart = draw->info.index.restart_enable,
+         .primitive_vertex_count = mesa_vertices_per_prim(draw->info.prim),
+         .attrib_bufs_valid = vi->bindings_valid,
+         .attribs_valid = vi->attributes_valid,
+         .index_min = UINT32_MAX,
+         .index_max = 0,
+      };
+
       if (shader_uses_sysval(vs, graphics, vs.first_vertex)) {
-         first_vertex_sysval = cmdbuf->state.gfx.vs.push_uniforms +
-                               shader_remapped_sysval_offset(
-                                  vs, sysval_offset(graphics, vs.first_vertex));
+         e.first_vertex_sysval = cmdbuf->state.gfx.vs.push_uniforms +
+                                 shader_remapped_sysval_offset(
+                                    vs, sysval_offset(graphics, vs.first_vertex));
       }
 
       if (shader_uses_sysval(vs, graphics, vs.base_instance)) {
-         first_instance_sysval =
-            cmdbuf->state.gfx.vs.push_uniforms +
-            shader_remapped_sysval_offset(
-               vs, sysval_offset(graphics, vs.base_instance));
+         e.first_instance_sysval = cmdbuf->state.gfx.vs.push_uniforms +
+                                   shader_remapped_sysval_offset(
+                                      vs, sysval_offset(graphics, vs.base_instance));
       }
 
       if (shader_uses_sysval(vs, graphics, vs.raw_vertex_offset)) {
-         raw_vertex_offset_sysval =
-            cmdbuf->state.gfx.vs.push_uniforms +
-            shader_remapped_sysval_offset(
-               vs, sysval_offset(graphics, vs.raw_vertex_offset));
+         e.raw_vertex_offset_sysval = cmdbuf->state.gfx.vs.push_uniforms +
+                                      shader_remapped_sysval_offset(
+                                         vs, sysval_offset(graphics, vs.raw_vertex_offset));
       }
 
-      enum panlib_barrier indirect_barrier =
-         PANLIB_BARRIER_JM_SUPPRESS_PREFETCH;
-      struct panlib_precomp_grid indirect_grid = panlib_1d_with_jm_deps(
-         1, init_heap_job_id, job_before_indirect_helper);
-
-      if (draw->info.indirect.buffer_dev_addr != 0 &&
-          draw->info.index.index_size) {
-         const struct panlib_draw_indexed_indirect_helper_args args = {
-            .cmd = draw->info.indirect.buffer_dev_addr,
-            .heap = panvk_priv_mem_dev_addr(dev->poly_heap.state),
-            .index_buffer_ptr = draw->info.index.buffer_dev_addr,
-            .index_min_max_res = index_min_max_res_ptr,
-            .index_size = draw->info.index.index_size,
-            .primitive_vertex_count =
-               mesa_vertices_per_prim(draw->info.prim),
-            .varying_bufs_descs = draw->varying_bufs,
-            .attrib_bufs_descs = draw->vs.attribute_bufs,
-            .attrib_bufs_infos = draw->indirect_info.attrib_bufs,
-            .attrib_bufs_valid = attrib_bufs_valid,
-            .attribs_valid = attribs_valid,
-            .attribs_descs = draw->vs.attributes,
-            .attribs_infos = draw->indirect_info.attribs,
-            .first_vertex_sysval = first_vertex_sysval,
-            .first_instance_sysval = first_instance_sysval,
-            .raw_vertex_offset_sysval = raw_vertex_offset_sysval,
-            .idvs_job = vs->info.vs.idvs ? draw->jobs.idvs.gpu : 0,
-            .vertex_job = draw->jobs.vertex.gpu,
-            .tiler_job = draw->jobs.tiler.gpu,
-         };
-         panlib_draw_indexed_indirect_helper_struct(&precomp_ctx, indirect_grid,
-                                                    indirect_barrier, args);
-      } else if (draw->info.indirect.buffer_dev_addr != 0) {
-         const struct panlib_draw_indirect_helper_args args = {
-            .cmd = draw->info.indirect.buffer_dev_addr,
-            .primitive_vertex_count =
-               mesa_vertices_per_prim(draw->info.prim),
-            .heap = panvk_priv_mem_dev_addr(dev->poly_heap.state),
-            .varying_bufs_descs = draw->varying_bufs,
-            .attrib_bufs_descs = draw->vs.attribute_bufs,
-            .attrib_bufs_infos = draw->indirect_info.attrib_bufs,
-            .attrib_bufs_valid = attrib_bufs_valid,
-            .attribs_valid = attribs_valid,
-            .attribs_descs = draw->vs.attributes,
-            .attribs_infos = draw->indirect_info.attribs,
-            .first_vertex_sysval = first_vertex_sysval,
-            .first_instance_sysval = first_instance_sysval,
-            .raw_vertex_offset_sysval = raw_vertex_offset_sysval,
-            .idvs_job = vs->info.vs.idvs ? draw->jobs.idvs.gpu : 0,
-            .vertex_job = draw->jobs.vertex.gpu,
-            .tiler_job = draw->jobs.tiler.gpu,
-         };
-         panlib_draw_indirect_helper_struct(&precomp_ctx, indirect_grid,
-                                            indirect_barrier, args);
-      } else {
-         assert(false && "Invalid indirect draw");
+      if (draw->info.index.index_size) {
+         struct pan_ptr m = panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(uint32_t), 4);
+         if (!m.gpu)
+            return;
+         e.index_min_out = m.gpu;
+         draw->index_min_addr = m.gpu;
       }
 
-      /* Grab the index of the indirect helper job */
-      uint32_t prev_job = batch->vtc_jc.job_index;
+      util_dynarray_append(&batch->draw_helper.entries, e);
+
+      /* The vertex job waits for the patch job and for this draw's descriptor copy. */
+      uint32_t prev_job = ready_job;
 
       if (vs->info.vs.idvs) {
          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
-                        false, 0, prev_job, &draw->jobs.idvs, false);
+                        false, copy_desc_job_id, prev_job, &draw->jobs.idvs, false);
       } else {
          unsigned vjob_id =
-            pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false, true, 0,
-                           prev_job, &draw->jobs.vertex, false);
+            pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX, false, true,
+                           copy_desc_job_id, prev_job, &draw->jobs.vertex, false);
 
+         unsigned tiler_dep = vjob_id;
+         if (draw->gs_varying_bufs) {
+            tiler_dep = emit_emulation_jobs(cmdbuf, draw, vjob_id);
+            if (!tiler_dep)
+               return;
+            /* The tiler reads what the emulation wrote, including its own index count. */
+            tiler_dep = emit_cache_flush_job(cmdbuf, tiler_dep);
+            if (cmdbuf->state.gfx.gs.xfb_counts)
+               emit_xfb_jobs(cmdbuf, tiler_dep);
+         }
+
+         /* suppress_prefetch: the helper (or the emulation) patches this descriptor on the GPU,
+          * exactly like the vertex job's, so it must not be fetched ahead of the patch. */
          if (draw->jobs.tiler.gpu != 0) {
-            pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_TILER, false, false,
-                           vjob_id, 0, &draw->jobs.tiler, false);
+            pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_TILER, false, true,
+                           tiler_dep, 0, &draw->jobs.tiler, false);
          }
       }
    }
@@ -1707,6 +2931,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
       cmdbuf->state.uses_poly_heap = false;
    }
 
+   cmdbuf->state.gfx.vs.push_uniforms = 0;
    clear_dirty_after_draw(cmdbuf);
 }
 
@@ -1767,6 +2992,139 @@ panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
    panvk_cmd_draw(cmdbuf, &draw);
 }
 
+/* How many vertices a direct indexed draw has to shade.
+ *
+ * The vertex job shades a CONTIGUOUS RANGE and the tiler then resolves index i to varying slot
+ * i + base_vertex_offset, so the range has to cover every index the draw can reference. The GPU
+ * helper narrows that range to [min_index, max_index] by scanning the index buffer first, which
+ * is why upstream needs the search kernel at all; it is an optimisation, not a requirement.
+ *
+ * Without reading the indices -- which we cannot do at record time, since the buffer's contents
+ * are only defined at submit time -- the sound bound is every vertex the bound attribute buffers
+ * can address. Indices past that are already undefined behaviour in Vulkan, and Mali clamps the
+ * fetch against ATTRIBUTE_BUFFER.size regardless, so nothing reads out of bounds.
+ *
+ * THE COST IS VERTEX SHADER INVOCATIONS, and it is paid by a draw that indexes a small part of
+ * a large shared vertex buffer. The fix for that is gallium panfrost's: a min/max scan of the
+ * index range with a per-resource cache (pan_minmax_cache_get in pan_helpers.c). That is a
+ * bounded optimisation to add on top of this; it is NOT what makes indexed draws work. */
+#define PANVK_DIRECT_INDEXED_MAX_RANGE (64u * 1024)
+
+static uint32_t
+direct_indexed_vertex_range(struct panvk_cmd_buffer *cmdbuf,
+                            uint32_t index_count, int32_t vertex_offset)
+{
+   const struct vk_vertex_input_state *vi =
+      cmdbuf->vk.dynamic_graphics_state.vi;
+   const struct vk_dynamic_graphics_state *dyns =
+      &cmdbuf->vk.dynamic_graphics_state;
+   uint32_t range = 0;
+   bool bounded = false;
+
+   u_foreach_bit(i, vi->bindings_valid) {
+      const struct vk_vertex_binding_state *binding = &vi->bindings[i];
+      uint32_t stride = dyns->vi_binding_strides[i];
+
+      /* Per-instance data is indexed by instance, not by vertex, so it says nothing about how
+       * far the index buffer can reach. A zero stride is the same story. */
+      if (binding->input_rate != VK_VERTEX_INPUT_RATE_VERTEX || !stride)
+         continue;
+
+      uint32_t verts = cmdbuf->state.gfx.vb.bufs[i].size / stride;
+
+      /* offset_start starts the fetch at vertexOffset, so that many vertices are already spent. */
+      if (vertex_offset > 0)
+         verts = verts > (uint32_t)vertex_offset ? verts - vertex_offset : 0;
+
+      range = bounded ? MIN2(range, verts) : verts;
+      bounded = true;
+   }
+
+   /* No per-vertex attribute bound: nothing constrains the indices, and the only per-vertex input
+    * left is gl_VertexIndex. index_count is the best available guess and is exact whenever the
+    * indices are a permutation of [0, index_count), which is the shape this case takes in
+    * practice (fullscreen passes and generated geometry). */
+   if (!bounded)
+      return index_count;
+
+   /* An index buffer can always name at least the vertices the draw asks for. */
+   return MAX2(range, index_count);
+}
+
+/* The indices live in an uncached mapping, where every load waits on memory: copy them out in
+ * bulk (memcpy moves 32 bytes per load pair and keeps several in flight), then take min and max
+ * from the cached copy in a loop the compiler vectorises. A restart index, the largest value of
+ * the type, is left out of the maximum by folding it to 0; it can only be the minimum when it is
+ * the only value, which the caller turns into an empty draw. */
+#define INDEX_SCAN(T)                                                          \
+   static void index_scan_##T(const T *src, uint32_t count, bool restart,     \
+                              uint32_t *lo, uint32_t *hi)                     \
+   {                                                                           \
+      const T rst = (T)~(T)0;                                                  \
+      T l = rst, h = 0, hr = 0;                                                \
+      T chunk[4096 / sizeof(T)];                                               \
+      for (uint32_t base = 0; base < count; base += ARRAY_SIZE(chunk)) {       \
+         const uint32_t n = MIN2(count - base, ARRAY_SIZE(chunk));             \
+         memcpy(chunk, src + base, n * sizeof(T));                             \
+         for (uint32_t i = 0; i < n; i++) {                                    \
+            const T v = chunk[i];                                              \
+            const T vr = v == rst ? 0 : v;                                     \
+            l = v < l ? v : l;                                                 \
+            h = v > h ? v : h;                                                 \
+            hr = vr > hr ? vr : hr;                                            \
+         }                                                                     \
+      }                                                                        \
+      if (!restart) {                                                          \
+         *lo = l;                                                              \
+         *hi = h;                                                              \
+      } else if (l != rst) {                                                   \
+         *lo = l;                                                              \
+         *hi = hr;                                                             \
+      }                                                                        \
+   }
+INDEX_SCAN(uint8_t)
+INDEX_SCAN(uint16_t)
+INDEX_SCAN(uint32_t)
+#undef INDEX_SCAN
+
+/* The [min, max] of the indices a direct indexed draw reads, from the CPU, when the bound index
+ * buffer allows it (see ib.cpu_readable). The vertex job then shades exactly that range. Without
+ * it, a draw out of a big streaming vertex buffer shades everything from vertexOffset to the end
+ * of the buffer: PCSX2 (ARMSX2) draws from a 32 MB ring, and its small sprite draws allocated up
+ * to 4 MB of varyings each, 2.4 GB in flight, until the process was killed for memory. Returns
+ * false when the scan cannot be done; min > max when every index is a restart index. */
+static bool
+cpu_index_range(struct panvk_cmd_buffer *cmdbuf, uint32_t first, uint32_t count,
+                uint32_t *min_out, uint32_t *max_out)
+{
+   const uint32_t isz = cmdbuf->state.gfx.ib.index_size;
+
+   if (!cmdbuf->state.gfx.ib.cpu_readable ||
+       ((uint64_t)first + count) * isz > cmdbuf->state.gfx.ib.size)
+      return false;
+
+   const void *p =
+      (const void *)(uintptr_t)(cmdbuf->state.gfx.ib.dev_addr + (uint64_t)first * isz);
+   const bool restart =
+      cmdbuf->vk.dynamic_graphics_state.ia.primitive_restart_enable;
+
+   *min_out = UINT32_MAX;
+   *max_out = 0;
+   switch (isz) {
+   case 1:
+      index_scan_uint8_t(p, count, restart, min_out, max_out);
+      return true;
+   case 2:
+      index_scan_uint16_t(p, count, restart, min_out, max_out);
+      return true;
+   case 4:
+      index_scan_uint32_t(p, count, restart, min_out, max_out);
+      return true;
+   default:
+      return false;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
                                uint32_t indexCount, uint32_t instanceCount,
@@ -1775,38 +3133,110 @@ panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
 
-   if (instanceCount == 0 || indexCount == 0)
+   /* A null index buffer (nullDescriptor): the indices would all read 0, but a JM job has no
+    * index buffer size to bound the reads with, and address 0 faults. Nothing is drawn, as for
+    * the indirect draws (CmdDrawIndexedIndirect). */
+   if (instanceCount == 0 || indexCount == 0 || cmdbuf->state.gfx.ib.size == 0)
       return;
 
    /* gl_BaseInstance is a signed integer, and it should expose the value of
     * firstInstnace. */
    assert(firstInstance < INT32_MAX);
 
-   struct pan_ptr indirect_index_alloc = panvk_cmd_alloc_dev_mem(
-      cmdbuf, desc, sizeof(struct VkDrawIndexedIndirectCommand), 8);
+   /* A direct indexed draw knows all of its own parameters, so it is emitted by the CPU like
+    * vkCmdDraw is, rather than being turned into a synthetic indirect draw for a GPU helper to
+    * resolve. See is_indirect_draw() for what that helper does not manage to do here. */
+   uint32_t min_index, max_index;
+   if (cpu_index_range(cmdbuf, firstIndex, indexCount, &min_index, &max_index) &&
+       (min_index > max_index || max_index - min_index < (1u << 24))) {
+      if (min_index > max_index)
+         return;
 
-   struct VkDrawIndexedIndirectCommand *indirect_index_alloc_ptr =
-      indirect_index_alloc.cpu;
+      /* The vertex job starts at vertexOffset + min_index, and base_vertex_offset
+       * (base - raw_offset = -min_index) maps index i back to varying slot i - min_index. */
+      const uint32_t range = max_index - min_index + 1;
+      struct panvk_draw_data draw = {
+         .info = {
+            .index = panvk_draw_info_index(cmdbuf, firstIndex),
+            .vertex.base = vertexOffset,
+            .vertex.raw_offset = vertexOffset + (int32_t)min_index,
+            .vertex.count = indexCount,
+            .instance.base = firstInstance,
+            .instance.count = instanceCount,
+            .prim = panvk_get_client_prim(cmdbuf),
+         },
+         .vertex_range = range,
+         .padded_vertex_count = padded_vertex_count(cmdbuf, range, instanceCount),
+         .cpu_index_min = min_index,
+      };
 
-   *indirect_index_alloc_ptr = (struct VkDrawIndexedIndirectCommand){
-      .indexCount = indexCount,
-      .instanceCount = instanceCount,
-      .firstIndex = firstIndex,
-      .vertexOffset = vertexOffset,
-      .firstInstance = firstInstance,
-   };
+      /* The emulated geometry and tessellation stages index the vertex shader's output by
+       * index - min, and read min from memory as they do after the GPU scan. */
+      if (min_index) {
+         struct pan_ptr m = panvk_cmd_alloc_dev_mem(cmdbuf, desc, 4, 4);
+         if (!m.gpu)
+            return;
+         *(uint32_t *)m.cpu = min_index;
+         draw.index_min_addr = m.gpu;
+      }
+
+      panvk_cmd_draw(cmdbuf, &draw);
+      return;
+   }
+
+   const uint32_t vertex_range =
+      direct_indexed_vertex_range(cmdbuf, indexCount, vertexOffset);
+
+   /* That bound is every vertex the bound buffers can address, which is a disaster for a draw
+    * that indexes a small part of a large shared vertex buffer: measured in Minecraft (every chunk
+    * section drawn out of one 256 MB block), 4.8 million vertices shaded and 255 MB of varyings
+    * allocated PER DRAW, until the process was killed for memory within seconds. Past
+    * PANVK_DIRECT_INDEXED_MAX_RANGE, and when the draw plainly uses far less, the GPU finds the
+    * real [min, max] index first, through the same scan and helper an indexed indirect draw uses
+    * (which is what upstream does for every indexed draw), from a command written here. */
+   if (vertex_range > PANVK_DIRECT_INDEXED_MAX_RANGE && vertex_range / 4 > indexCount) {
+      struct pan_ptr c =
+         panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(VkDrawIndexedIndirectCommand), 4);
+      if (c.gpu) {
+         *(VkDrawIndexedIndirectCommand *)c.cpu = (VkDrawIndexedIndirectCommand){
+            .indexCount = indexCount,
+            .instanceCount = instanceCount,
+            .firstIndex = firstIndex,
+            .vertexOffset = vertexOffset,
+            .firstInstance = firstInstance,
+         };
+         struct panvk_draw_data idraw = {
+            .info = {
+               .index = panvk_draw_info_index(cmdbuf, 0),
+               .indirect.buffer_dev_addr = c.gpu,
+               .indirect.draw_count = 1,
+               .indirect.stride = sizeof(VkDrawIndexedIndirectCommand),
+               .prim = panvk_get_client_prim(cmdbuf),
+            },
+         };
+         panvk_cmd_draw_indirect(cmdbuf, &idraw);
+         return;
+      }
+   }
 
    struct panvk_draw_data draw = {
       .info = {
-         .index = panvk_draw_info_index(cmdbuf, 0),
-         .indirect.buffer_dev_addr = indirect_index_alloc.gpu,
-         .indirect.draw_count = 1,
-         .indirect.stride = 0,
+         .index = panvk_draw_info_index(cmdbuf, firstIndex),
+         /* min_index is taken as 0, so raw_offset is just the application's vertexOffset and
+          * base_vertex_offset (base - raw_offset) comes out zero. */
+         .vertex.base = vertexOffset,
+         .vertex.raw_offset = vertexOffset,
+         .vertex.count = indexCount,
+         .instance.base = firstInstance,
+         .instance.count = instanceCount,
          .prim = panvk_get_client_prim(cmdbuf),
       },
+      .vertex_range = vertex_range,
+      .padded_vertex_count =
+         padded_vertex_count(cmdbuf, vertex_range, instanceCount),
    };
 
-   panvk_cmd_draw_indirect(cmdbuf, &draw);
+   panvk_cmd_draw(cmdbuf, &draw);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1817,22 +3247,21 @@ panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
    VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
 
-   if (drawCount == 0)
-      return;
+   /* The job manager takes one indirect draw at a time: multiDrawIndirect is drawCount of
+    * them, each reading its own command. */
+   for (uint32_t i = 0; i < drawCount; i++) {
+      struct panvk_draw_data draw = {
+         .info = {
+            .indirect.buffer_dev_addr =
+               panvk_buffer_gpu_ptr(buffer, offset + (VkDeviceSize)i * stride),
+            .indirect.draw_count = 1,
+            .indirect.stride = stride,
+            .prim = panvk_get_client_prim(cmdbuf),
+         },
+      };
 
-   /* We cannot support arbitrary draw count on JM */
-   assert(drawCount == 1);
-
-   struct panvk_draw_data draw = {
-      .info = {
-         .indirect.buffer_dev_addr = panvk_buffer_gpu_ptr(buffer, offset),
-         .indirect.draw_count = drawCount,
-         .indirect.stride = stride,
-         .prim = panvk_get_client_prim(cmdbuf),
-      },
-   };
-
-   panvk_cmd_draw_indirect(cmdbuf, &draw);
+      panvk_cmd_draw_indirect(cmdbuf, &draw);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1852,20 +3281,21 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
    if (drawCount == 0 || cmdbuf->state.gfx.ib.size == 0)
       return;
 
-   /* We cannot support arbitrary draw count on JM */
-   assert(drawCount == 1);
+   /* One indirect draw at a time, as in CmdDrawIndirect. */
+   for (uint32_t i = 0; i < drawCount; i++) {
+      struct panvk_draw_data draw = {
+         .info = {
+            .index = panvk_draw_info_index(cmdbuf, 0),
+            .indirect.buffer_dev_addr =
+               panvk_buffer_gpu_ptr(buffer, offset + (VkDeviceSize)i * stride),
+            .indirect.draw_count = 1,
+            .indirect.stride = stride,
+            .prim = panvk_get_client_prim(cmdbuf),
+         },
+      };
 
-   struct panvk_draw_data draw = {
-      .info = {
-         .index = panvk_draw_info_index(cmdbuf, 0),
-         .indirect.buffer_dev_addr = panvk_buffer_gpu_ptr(buffer, offset),
-         .indirect.draw_count = drawCount,
-         .indirect.stride = stride,
-         .prim = panvk_get_client_prim(cmdbuf),
-      },
-   };
-
-   panvk_cmd_draw_indirect(cmdbuf, &draw);
+      panvk_cmd_draw_indirect(cmdbuf, &draw);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1920,4 +3350,128 @@ panvk_per_arch(CmdEndRendering2KHR)(
       cmdbuf->cur_batch = NULL;
       panvk_per_arch(cmd_meta_resolve_attachments)(cmdbuf);
    }
+}
+
+/* --- VK_EXT_transform_feedback -------------------------------------------------------------- */
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdBindTransformFeedbackBuffers2EXT)(
+   VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pBindingInfos)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   for (uint32_t i = 0; i < bindingCount && firstBinding + i < 4; i++) {
+      cmdbuf->state.gfx.xfb.addr[firstBinding + i] = pBindingInfos[i].addressRange.address;
+      cmdbuf->state.gfx.xfb.size[firstBinding + i] =
+         MIN2(pBindingInfos[i].addressRange.size, UINT32_MAX);
+   }
+}
+
+/* Load the write offsets from the counter buffers (Begin) or store them there (End). Without a
+ * counter, Begin starts at 0, which the CPU can write itself. */
+static void
+xfb_counters(struct panvk_cmd_buffer *cmdbuf, uint32_t first, uint32_t count,
+             const VkBindTransformFeedbackBuffer2InfoEXT *infos, bool load)
+{
+   uint64_t c[4] = {0};
+   for (uint32_t i = 0; infos && i < count && first + i < 4; i++)
+      c[first + i] = infos[i].addressRange.address;
+   const bool any = c[0] || c[1] || c[2] || c[3];
+
+   if (load) {
+      struct pan_ptr slot = panvk_cmd_alloc_dev_mem(cmdbuf, desc, 16, 16);
+      if (!slot.gpu)
+         return;
+      memset(slot.cpu, 0, 16);
+      cmdbuf->state.gfx.xfb.offsets = slot.gpu;
+   }
+   if (!any)
+      return;
+
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   const struct panlib_xfb_counters_args args = {
+      .offsets = cmdbuf->state.gfx.xfb.offsets,
+      .c0 = c[0],
+      .c1 = c[1],
+      .c2 = c[2],
+      .c3 = c[3],
+      .load = load,
+   };
+   panlib_xfb_counters_struct(&precomp_ctx,
+                              panlib_1d_with_jm_deps(1, 0, cmdbuf->state.gfx.xfb.last_job),
+                              PANLIB_BARRIER_JM_BARRIER, args);
+   cmdbuf->state.gfx.xfb.last_job =
+      emit_cache_flush_job(cmdbuf, cmdbuf->cur_batch->vtc_jc.job_index);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdBeginTransformFeedback2EXT)(
+   VkCommandBuffer commandBuffer, uint32_t firstCounterRange, uint32_t counterRangeCount,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pCounterInfos)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   xfb_counters(cmdbuf, firstCounterRange, counterRangeCount, pCounterInfos, true);
+   cmdbuf->state.gfx.xfb.active = true;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdEndTransformFeedback2EXT)(
+   VkCommandBuffer commandBuffer, uint32_t firstCounterRange, uint32_t counterRangeCount,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pCounterInfos)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   xfb_counters(cmdbuf, firstCounterRange, counterRangeCount, pCounterInfos, false);
+   cmdbuf->state.gfx.xfb.active = false;
+}
+
+/* An indirect draw whose vertex count panlib_xfb_byte_count derives from the counter. The draw
+ * helper of a batch reads every indirect command of the batch at its first indirect draw, so
+ * the count is computed at the end of the current batch (after its capture jobs, which may
+ * have written the counter) and the draw goes into the next one. */
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdDrawIndirectByteCount2EXT)(
+   VkCommandBuffer commandBuffer, uint32_t instanceCount, uint32_t firstInstance,
+   const VkBindTransformFeedbackBuffer2InfoEXT *pCounterInfo, uint32_t counterOffset,
+   uint32_t vertexStride)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+
+   if (!instanceCount || !vertexStride || !pCounterInfo->addressRange.address)
+      return;
+
+   struct pan_ptr c = panvk_cmd_alloc_dev_mem(cmdbuf, desc, sizeof(VkDrawIndirectCommand), 4);
+   if (!c.gpu)
+      return;
+   *(VkDrawIndirectCommand *)c.cpu = (VkDrawIndirectCommand){
+      .instanceCount = instanceCount,
+      .firstInstance = firstInstance,
+   };
+
+   if (!cmdbuf->cur_batch)
+      panvk_per_arch(cmd_open_batch)(cmdbuf);
+   struct panvk_precomp_ctx precomp_ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+   const struct panlib_xfb_byte_count_args args = {
+      .counter = pCounterInfo->addressRange.address,
+      .cmd = c.gpu,
+      .counter_offset = counterOffset,
+      .vertex_stride = vertexStride,
+   };
+   panlib_xfb_byte_count_struct(&precomp_ctx,
+                                panlib_1d_with_jm_deps(1, 0, cmdbuf->state.gfx.xfb.last_job),
+                                PANLIB_BARRIER_JM_BARRIER, args);
+   panvk_per_arch(cmd_close_batch)(cmdbuf);
+   panvk_per_arch(cmd_open_batch)(cmdbuf);
+
+   struct panvk_draw_data draw = {
+      .info = {
+         .indirect.buffer_dev_addr = c.gpu,
+         .indirect.draw_count = 1,
+         .indirect.stride = sizeof(VkDrawIndirectCommand),
+         .prim = panvk_get_client_prim(cmdbuf),
+      },
+   };
+   panvk_cmd_draw_indirect(cmdbuf, &draw);
 }
