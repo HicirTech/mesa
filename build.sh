@@ -6,6 +6,8 @@
 #   first stage builds host tools that need LLVM.
 #   BUILD_DIR overrides the Android build directory (default: build-android).
 #   GRALLOC=0 builds without the libui gralloc backend (see README.md, Gralloc).
+#   KRAID=0 builds without KRAID, the Rust shader compiler for Valhall and newer. With it (the
+#   default), stage 2 needs rustc with the aarch64-linux-android target and bindgen.
 #
 # Two stages:
 #   1. build-host: mesa_clc, vtn_bindgen2 and panfrost_compile, native, from this tree. They
@@ -52,6 +54,7 @@ if [ ! -f "$HOSTB/build.ninja" ]; then
       -Dbuildtype=debugoptimized \
       -Dmesa-clc=enabled -Dprecomp-compiler=enabled \
       -Dvulkan-drivers=panfrost -Dgallium-drivers= -Dplatforms= -Dllvm=enabled \
+      -Dpanfrost-rust=false \
       -Dgles1=disabled -Dgles2=disabled -Degl=disabled -Dglx=disabled -Dgbm=disabled \
       -Dtools= -Dvideo-codecs= \
       -Dallow-fallback-for=libdrm --force-fallback-for=libdrm,expat,zlib \
@@ -79,6 +82,21 @@ if [ "${GRALLOC:-1}" != 0 ]; then
    python3 android/gralloc/mkstubs.py "$BIN/aarch64-linux-android31-clang" "$GRALLOC_DEPS/libs-a12"
 fi
 
+KRAID_OPT=-Dpanfrost-rust=false
+RUST_BINARY=
+RUST_PROPERTIES=
+if [ "${KRAID:-1}" != 0 ]; then
+   for tool in rustc bindgen; do
+      if ! command -v "$tool" >/dev/null 2>&1; then
+         echo "error: $tool not found in PATH (or build with KRAID=0)" >&2
+         exit 1
+      fi
+   done
+   KRAID_OPT=-Dpanfrost-rust=true
+   RUST_BINARY="rust = ['rustc', '--target', 'aarch64-linux-android', '-C', 'linker=$BIN/aarch64-linux-android31-clang']"
+   RUST_PROPERTIES="bindgen_clang_arguments = ['--target=aarch64-linux-android31', '--sysroot=$NDK/toolchains/llvm/prebuilt/$HOST/sysroot']"
+fi
+
 cat > "$BUILD/cross.ini" <<EOF
 [binaries]
 c = '$BIN/aarch64-linux-android31-clang'
@@ -86,11 +104,13 @@ cpp = '$BIN/aarch64-linux-android31-clang++'
 ar = '$BIN/llvm-ar'
 strip = '$BIN/llvm-strip'
 pkg-config = 'pkg-config'
+$RUST_BINARY
 
 [properties]
 # Keep the host's .pc files out of the cross build.
 pkg_config_libdir = ['$PWD/$BUILD/pkgconfig-empty']
 cpp_link_args = ['-static-libstdc++']
+$RUST_PROPERTIES
 
 [host_machine]
 system = 'android'
@@ -106,14 +126,14 @@ if [ ! -f "$BUILD/build.ninja" ]; then
       -Dandroid-libbacktrace=disabled \
       -Dvulkan-drivers=panfrost -Dgallium-drivers= -Dvulkan-layers= -Dtools= -Dvideo-codecs= \
       -Dxclipse-gralloc-deps="$GRALLOC_DEPS" \
-      -Dmesa-clc=system -Dprecomp-compiler=system \
+      -Dmesa-clc=system -Dprecomp-compiler=system "$KRAID_OPT" \
       -Dllvm=disabled -Dzstd=disabled -Dlmsensors=disabled -Dperfetto=false \
       -Dglx=disabled -Dgbm=disabled -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
       -Dallow-fallback-for=libdrm,perfetto --force-fallback-for=expat,libdrm,zlib \
       -Dlibdrm:default_library=static -Dexpat:default_library=static -Dzlib:default_library=static
 else
-   # An existing build directory follows GRALLOC too.
-   meson configure "$BUILD" -Dxclipse-gralloc-deps="$GRALLOC_DEPS"
+   # An existing build directory follows GRALLOC and KRAID too.
+   meson configure "$BUILD" -Dxclipse-gralloc-deps="$GRALLOC_DEPS" "$KRAID_OPT"
 fi
 
 ninja -C "$BUILD" src/panfrost/vulkan/libvulkan_panfrost.so
