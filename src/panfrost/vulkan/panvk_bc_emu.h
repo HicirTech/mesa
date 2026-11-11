@@ -50,8 +50,9 @@ enum panvk_bc_emu_variant {
    PANVK_BC_EMU_BC3,   /* BC7 -> BC3 */
    PANVK_BC_EMU_SNORM8,
    PANVK_BC_EMU_F16,
-   PANVK_BC_EMU_ASTC,  /* BC1/BC2/BC3/BC7 -> ASTC 4x4 */
+   PANVK_BC_EMU_ASTC,  /* BC1 -> ASTC 4x4 */
    PANVK_BC_EMU_EAC_R, /* BC4 -> EAC_R11 */
+   PANVK_BC_EMU_UNORM8, /* BC2/BC3/BC7 -> RGBA8, exact */
    PANVK_BC_EMU_VARIANT_COUNT,
 };
 

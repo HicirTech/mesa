@@ -81,7 +81,7 @@ libpanvk_files += custom_target(
 )
 foreach v : [['u32x4', 'BC_OUT_U32X4'], ['eac', 'BC_OUT_EAC'], ['bc3', 'BC_OUT_BC3'],
              ['snorm8', 'BC_OUT_SNORM8'], ['f16', 'BC_OUT_F16'], ['astc', 'BC_OUT_ASTC'],
-             ['eac_r', 'BC_OUT_EAC_R']]
+             ['eac_r', 'BC_OUT_EAC_R'], ['unorm8', 'BC_OUT_UNORM8']]
   foreach d : [['', []], ['_3d', ['-DBC_3D']]]
     libpanvk_files += custom_target(
       'bc_decoder_@0@@1@_spv.h'.format(v[0], d[0]),

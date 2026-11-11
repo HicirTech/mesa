@@ -67,6 +67,12 @@ static const uint32_t bc_emu_eac_r_spv[] = {
 static const uint32_t bc_emu_eac_r_3d_spv[] = {
 #include "bc_decoder_eac_r_3d_spv.h"
 };
+static const uint32_t bc_emu_unorm8_spv[] = {
+#include "bc_decoder_unorm8_spv.h"
+};
+static const uint32_t bc_emu_unorm8_3d_spv[] = {
+#include "bc_decoder_unorm8_3d_spv.h"
+};
 
 /* The BC5 -> EAC_R11G11 tables, generated offline for RADV (eac_lut, eac_remap). */
 #include "eac_lut.h"
@@ -120,17 +126,23 @@ panvk_bc_emu_carrier(const struct panvk_physical_device *pdev, VkFormat format)
       return VK_FORMAT_UNDEFINED;
    const bool all = profile == PANVK_BC_EMU_ALL;
 
+   /* With no BC decoder, BC1 maps onto ASTC 4x4 closely (two endpoints, four interpolated
+    * levels). BC2, BC3 and BC7 do not: the ASTC encoder here uses one weight plane, which cannot
+    * hold BC3's independent alpha, and it misplaces the endpoints of partitioned BC7 blocks. They
+    * decode exactly to RGBA8 instead, at four times the memory. */
    switch (format) {
    case VK_FORMAT_BC1_RGB_UNORM_BLOCK:
    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
-   case VK_FORMAT_BC2_UNORM_BLOCK:
-   case VK_FORMAT_BC3_UNORM_BLOCK:
       return all ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK : VK_FORMAT_UNDEFINED;
    case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+      return all ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_UNDEFINED;
+   case VK_FORMAT_BC2_UNORM_BLOCK:
+   case VK_FORMAT_BC3_UNORM_BLOCK:
+      return all ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_UNDEFINED;
    case VK_FORMAT_BC2_SRGB_BLOCK:
    case VK_FORMAT_BC3_SRGB_BLOCK:
-      return all ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_UNDEFINED;
+      return all ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_UNDEFINED;
    case VK_FORMAT_BC4_UNORM_BLOCK:
       return all ? VK_FORMAT_EAC_R11_UNORM_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
    case VK_FORMAT_BC4_SNORM_BLOCK:
@@ -143,11 +155,11 @@ panvk_bc_emu_carrier(const struct panvk_physical_device *pdev, VkFormat format)
    case VK_FORMAT_BC6H_SFLOAT_BLOCK:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
    case VK_FORMAT_BC7_UNORM_BLOCK:
-      return all ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+      return all ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_BC3_UNORM_BLOCK;
    case VK_FORMAT_BC7_SRGB_BLOCK:
-      /* The decoded BC7 values are the sRGB-encoded ones, re-encoded as they are; the sRGB
+      /* The decoded BC7 values are the sRGB-encoded ones, stored as they are; the sRGB
        * carrier decodes them the same way. */
-      return all ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_BC3_SRGB_BLOCK;
+      return all ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_BC3_SRGB_BLOCK;
    default:
       return VK_FORMAT_UNDEFINED;
    }
@@ -157,6 +169,9 @@ VkFormat
 panvk_bc_emu_store_format(const struct panvk_physical_device *pdev, VkFormat format)
 {
    const VkFormat carrier = panvk_bc_emu_carrier(pdev, format);
+   /* Storage images have no sRGB formats: the transcoder writes the encoded bytes as UNORM. */
+   if (carrier == VK_FORMAT_R8G8B8A8_SRGB)
+      return VK_FORMAT_R8G8B8A8_UNORM;
    if (!vk_format_is_compressed(carrier))
       return carrier;
    return vk_format_get_blocksize(carrier) == 8 ? VK_FORMAT_R32G32_UINT
@@ -219,6 +234,9 @@ bc_emu_variant(const struct panvk_physical_device *pdev, VkFormat format)
       return PANVK_BC_EMU_SNORM8;
    case VK_FORMAT_R16G16B16A16_SFLOAT:
       return PANVK_BC_EMU_F16;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      return PANVK_BC_EMU_UNORM8;
    default:
       /* BC3 planes come from BC4 (byte shuffle) or BC7 (decode and re-encode). */
       return format == VK_FORMAT_BC4_UNORM_BLOCK ? PANVK_BC_EMU_U32X4 : PANVK_BC_EMU_BC3;
@@ -293,7 +311,7 @@ panvk_bc_emu_get_pipeline(struct panvk_device *dev, VkFormat format, bool is_3d,
    } spv[PANVK_BC_EMU_VARIANT_COUNT][2] = {
       SPV(PANVK_BC_EMU_U32X4, u32x4), SPV(PANVK_BC_EMU_EAC, eac),     SPV(PANVK_BC_EMU_BC3, bc3),
       SPV(PANVK_BC_EMU_SNORM8, snorm8), SPV(PANVK_BC_EMU_F16, f16),   SPV(PANVK_BC_EMU_ASTC, astc),
-      SPV(PANVK_BC_EMU_EAC_R, eac_r),
+      SPV(PANVK_BC_EMU_EAC_R, eac_r),   SPV(PANVK_BC_EMU_UNORM8, unorm8),
    };
 #undef SPV
    const VkShaderModuleCreateInfo module_info = {

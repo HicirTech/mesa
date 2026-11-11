@@ -2457,6 +2457,35 @@ uvec4 a7_encode()
 }
 #endif
 
+#if defined(BC_OUT_UNORM8)
+/* A BC1 colour block at base_bit (BC1 itself, or the colour half of BC2 and BC3) decoded to
+ * RGBA texels in [0, 1]. BC2 and BC3 always interpolate four colours; BC1 switches to three
+ * colours and a black entry (transparent for BC1_RGBA) when c0 <= c1. */
+void bc_bc1_decode(uvec4 blk, int base_bit, bool four_color, bool rgba, out vec4 texels[16])
+{
+   const uint c0 = bc_bits(blk, base_bit, 16), c1 = bc_bits(blk, base_bit + 16, 16);
+   const ivec3 q0 = ivec3(int(c0 >> 11u) & 31, int(c0 >> 5u) & 63, int(c0) & 31);
+   const ivec3 q1 = ivec3(int(c1 >> 11u) & 31, int(c1 >> 5u) & 63, int(c1) & 31);
+   const ivec3 a = ivec3((q0.x << 3) | (q0.x >> 2), (q0.y << 2) | (q0.y >> 4),
+                         (q0.z << 3) | (q0.z >> 2));
+   const ivec3 b = ivec3((q1.x << 3) | (q1.x >> 2), (q1.y << 2) | (q1.y >> 4),
+                         (q1.z << 3) | (q1.z >> 2));
+   vec4 pal[4];
+   pal[0] = vec4(vec3(a) / 255.0, 1.0);
+   pal[1] = vec4(vec3(b) / 255.0, 1.0);
+   if (four_color || c0 > c1) {
+      pal[2] = vec4(vec3((2 * a + b + 1) / 3) / 255.0, 1.0);
+      pal[3] = vec4(vec3((a + 2 * b + 1) / 3) / 255.0, 1.0);
+   } else {
+      pal[2] = vec4(vec3((a + b) / 2) / 255.0, 1.0);
+      pal[3] = vec4(0.0, 0.0, 0.0, rgba ? 0.0 : 1.0);
+   }
+   const uint idx = bc_bits(blk, base_bit + 32, 32);
+   for (int t = 0; t < 16; t++)
+      texels[t] = pal[(idx >> uint(2 * t)) & 3u];
+}
+#endif
+
 /* ------------------------------------------------------------------- main */
 
 void main()
@@ -2605,6 +2634,23 @@ void main()
       bc_rgtc_block(blk, 0, true, red);
       bc_rgtc_block(blk, 64, true, green);
       for (int t = 0; t < 16; t++) texels[t] = vec4(red[t], green[t], 0.0, 1.0);
+      break;
+#endif
+#if defined(BC_OUT_UNORM8)
+   /* Exact decode of BC1-BC3 for a texture unit that has no BC decoder. The BC3 alpha half has
+    * the layout of a BC4_UNORM block. */
+   case BC_FMT_BC1_RGB:
+   case BC_FMT_BC1_RGBA:
+      bc_bc1_decode(blk, 0, false, pc.format == BC_FMT_BC1_RGBA, texels);
+      break;
+   case BC_FMT_BC2:
+      bc_bc1_decode(blk, 64, true, false, texels);
+      for (int t = 0; t < 16; t++) texels[t].a = float(bc_bits(blk, 4 * t, 4)) / 15.0;
+      break;
+   case BC_FMT_BC3:
+      bc_bc1_decode(blk, 64, true, false, texels);
+      bc_rgtc_block(blk, 0, false, red);
+      for (int t = 0; t < 16; t++) texels[t].a = red[t];
       break;
 #endif
    default: /* BC_FMT_BC7 */
