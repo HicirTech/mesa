@@ -469,6 +469,9 @@ struct panvk_shader_variant {
       uint64_t vs_xfb_info[PANVK_VS_XFB_INFO_QWORDS];
       /* Geometry shaders: writes gl_ViewportIndex (see panvk_nir_lower_viewport_scissor_fs). */
       bool writes_viewport;
+      /* Geometry and tess eval shaders: writes gl_Layer. On v9+ the layer travels in the output
+       * record and the rasterization variant writes it for the tiler (v9_build_gs_rast). */
+      bool writes_layer;
       /* Tess control and tess eval shaders: the execution modes, which either stage may carry
        * (enum tess_primitive_mode, enum gl_tess_spacing). The draw merges the two. */
       uint8_t tess_prim;

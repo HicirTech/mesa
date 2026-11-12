@@ -684,8 +684,19 @@ lower_emit_vertex(nir_builder *b, nir_intrinsic_instr *intr, struct lower_gs_sta
             continue;
          }
 
-         /* Point size lives in its own fp16 buffer, and the other built-ins (layer, clip
-          * distances) have no path to the tiler here yet. */
+         /* gl_Layer: on v9+ the record has a slot for it and the rasterization variant writes it
+          * for the tiler (v9_build_gs_rast). Elsewhere the table marks it unused: no path. */
+         if (loc == VARYING_SLOT_LAYER) {
+            nir_def *offset = load_slot_offset(b, st->out_offsets, VARYING_SLOT_LAYER);
+            nir_push_if(b, nir_ine_imm(b, offset, PANVK_GS_SLOT_UNUSED));
+            nir_def *byte = nir_iadd(b, nir_imul(b, slot, st->out_general_stride), offset);
+            store_components(b, st->out_general, byte, nir_load_var(b, var));
+            nir_pop_if(b, NULL);
+            continue;
+         }
+
+         /* Point size lives in its own fp16 buffer, and the other built-ins (clip distances)
+          * have no path to the tiler here yet. */
          /* v9+ polygon mode carries the clip distances as plain vec4 slots
           * (build_polygon_mode_gs); a compact gl_ClipDistance still has no path. */
          if ((loc < VARYING_SLOT_VAR0 && loc != VARYING_SLOT_CLIP_DIST0 &&

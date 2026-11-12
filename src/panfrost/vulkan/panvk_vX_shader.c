@@ -1234,7 +1234,8 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
  *    job over the emulation's index buffer. The fragment shader is linked against it.
  */
 
-/* One 16-byte slot per generic location in `written`, in location order. */
+/* One 16-byte slot per generic location in `written`, in location order, plus gl_Layer, which
+ * the rasterization variant reads back and writes for the tiler. */
 static uint32_t
 v9_gs_record_layout(uint64_t written, uint32_t *offsets)
 {
@@ -1243,7 +1244,8 @@ v9_gs_record_layout(uint64_t written, uint32_t *offsets)
       offsets[i] = PANVK_GS_SLOT_UNUSED;
    u_foreach_bit64(loc, written) {
       if ((loc < VARYING_SLOT_VAR0 && loc != PANVK_GS_VIEWPORT_INDEX_SLOT &&
-           loc != VARYING_SLOT_CLIP_DIST0 && loc != VARYING_SLOT_CLIP_DIST1) ||
+           loc != VARYING_SLOT_LAYER && loc != VARYING_SLOT_CLIP_DIST0 &&
+           loc != VARYING_SLOT_CLIP_DIST1) ||
           loc >= 64)
          continue;
       offsets[loc] = stride;
@@ -1470,6 +1472,19 @@ v9_build_gs_rast(struct panvk_device *dev, const struct v9_gs_out *outs, unsigne
       clip = nir_if_phi(&b, moved, clip);
    }
    nir_store_var(&b, pos, clip, 0xf);
+
+   /* gl_Layer. Written here, by the shader the tiler runs, it routes the primitive to its layer
+    * the way a vertex shader's own gl_Layer does (layer_index_enable follows VARYING_BIT_LAYER).
+    * Layered rendering through a geometry shader -- UE4 builds its tonemapping LUT that way, one
+    * instance per volume slice -- otherwise lands every primitive on layer 0. */
+   if (gs->gs.writes_layer) {
+      nir_def *byte = nir_iadd_imm(&b, nir_imul_imm(&b, vid, gs->gs.rec_stride),
+                                   gs->gs.rec_offsets[VARYING_SLOT_LAYER]);
+      nir_variable *layer =
+         nir_variable_create(b.shader, nir_var_shader_out, glsl_int_type(), "gl_Layer");
+      layer->data.location = VARYING_SLOT_LAYER;
+      nir_store_var(&b, layer, v9_load_record(&b, gen_base, byte, 1), 0x1);
+   }
 
    for (unsigned i = 0; i < n; i++) {
       char name[16];
@@ -2591,6 +2606,9 @@ panvk_compile_shader(struct panvk_device *dev,
          variant->gs.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT);
       if (variant->gs.writes_viewport)
          variant->gs.outputs_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      /* gl_Layer reaches the tiler through the rasterization variant (v9_build_gs_rast). */
+      variant->gs.writes_layer =
+         variant->gs.outputs_written & BITFIELD64_BIT(VARYING_SLOT_LAYER);
       variant->gs.output_prim = nir->info.gs.output_primitive;
 
       const int xfb_dwords = panvk_gs_xfb_table(nir->xfb_info, variant->gs.xfb_table);
@@ -2615,6 +2633,8 @@ panvk_compile_shader(struct panvk_device *dev,
       const unsigned v9_nouts = v9_collect_gs_outputs(nir, v9_outs, &v9_written);
       if (variant->gs.writes_viewport)
          v9_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      if (variant->gs.writes_layer)
+         v9_written |= BITFIELD64_BIT(VARYING_SLOT_LAYER);
       variant->gs.rec_stride = v9_gs_record_layout(v9_written, variant->gs.rec_offsets);
 #endif
 
@@ -2754,6 +2774,8 @@ panvk_compile_shader(struct panvk_device *dev,
          variant->gs.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VIEWPORT);
       if (variant->gs.writes_viewport)
          variant->gs.outputs_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      variant->gs.writes_layer =
+         variant->gs.outputs_written & BITFIELD64_BIT(VARYING_SLOT_LAYER);
       variant->gs.output_prim = MESA_PRIM_POINTS;
 
       const int xfb_dwords = panvk_gs_xfb_table(nir->xfb_info, variant->gs.xfb_table);
@@ -2778,6 +2800,8 @@ panvk_compile_shader(struct panvk_device *dev,
       const unsigned v9_nouts = v9_collect_gs_outputs(nir, v9_outs, &v9_written);
       if (variant->gs.writes_viewport)
          v9_written |= BITFIELD64_BIT(PANVK_GS_VIEWPORT_INDEX_SLOT);
+      if (variant->gs.writes_layer)
+         v9_written |= BITFIELD64_BIT(VARYING_SLOT_LAYER);
       variant->gs.rec_stride = v9_gs_record_layout(v9_written, variant->gs.rec_offsets);
 #endif
 
