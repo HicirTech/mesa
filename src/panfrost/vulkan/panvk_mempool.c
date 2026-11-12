@@ -4,11 +4,28 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <dlfcn.h>
+
 #include "panvk_device.h"
 #include "panvk_mempool.h"
 #include "panvk_priv_bo.h"
 
 #include "kmod/pan_kmod.h"
+#include "util/u_debug.h"
+
+/* PANVK_POOL_EFENCE=1, for debugging: every allocation of a pool that owns its BOs (the command
+ * buffers' CS, descriptor and TLS pools), whole-slab ones excepted, gets a BO of its own and ends
+ * flush with it, so a GPU read past any allocation's end leaves its BO -- which the kbase
+ * backend's KBASE_GUARD_PAGES turns into a fault that names the BO. The BO's label names the
+ * code that allocated it. Slow: a kernel allocation and two mappings per allocation. */
+static bool
+panvk_pool_efence(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = debug_get_bool_option("PANVK_POOL_EFENCE", false);
+   return on;
+}
 
 void
 panvk_bo_pool_cleanup(struct panvk_bo_pool *bo_pool)
@@ -137,6 +154,33 @@ panvk_pool_alloc_mem(struct panvk_pool *pool, struct panvk_pool_alloc_info info)
 
    if (pool->props.needs_locking)
       simple_mtx_lock(&pool->lock);
+
+   if (unlikely(panvk_pool_efence()) && pool->props.owns_bos &&
+       info.size < pool->base.slab_size) {
+      const size_t bo_sz =
+         ALIGN_POT(MAX2(info.size, 1), panvk_get_gpu_page_size(pool->dev));
+      char label[72];
+      Dl_info dl;
+      const void *pc = __builtin_return_address(0);
+      snprintf(label, sizeof(label), "efence %zu at +0x%zx in %s", info.size,
+               dladdr(pc, &dl) && dl.dli_fbase
+                  ? (size_t)((const char *)pc - (const char *)dl.dli_fbase)
+                  : (size_t)(uintptr_t)pc,
+               pool->props.label ? pool->props.label : "?");
+      struct panvk_priv_bo *ebo = NULL;
+      if (panvk_priv_bo_create(pool->dev, bo_sz, pool->props.create_flags,
+                               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, label,
+                               &ebo) == VK_SUCCESS) {
+         list_addtail(&ebo->node, &pool->big_bos);
+         pool->bo_count++;
+         if (pool->props.needs_locking)
+            simple_mtx_unlock(&pool->lock);
+         return (struct panvk_priv_mem){
+            .bo = (uintptr_t)ebo | PANVK_PRIV_MEM_OWNED_BY_POOL,
+            .offset = (bo_sz - info.size) & ~(size_t)(info.alignment - 1),
+         };
+      }
+   }
 
    /* Find or create a suitable BO */
    struct panvk_priv_bo *bo = pool->transient_bo;
