@@ -25,6 +25,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -2209,6 +2211,29 @@ struct pan_kmod_kbase_csf_group {
    bool faulted;
 };
 
+/* A fence handed out by pan_kmod_kbase_csf_fence_fd whose submission is not done yet.
+ *
+ * On the Tab S10 Ultra's kernel (MediaTek/Samsung r44p1) a fence signal that waits in a KCPU
+ * queue for 2 s trips kcpu_queue_timeout_worker, whose queue dump overruns a buffer and panics
+ * the device (kbasep_csf_sync_kcpu_dump_locked). The timer starts when the signal is enqueued
+ * (or when the one before it signals), so the poll thread drains the queue itself once the
+ * oldest export has waited KBASE_CSF_FENCE_WATCHDOG_NS, or as soon as its group faults:
+ * deleting a KCPU queue skips its waits and signals its fences (delete_queue). A GPU job that
+ * really runs longer than that shows a frame early; a hang or a fault no longer takes the
+ * device down. */
+/* Every submission that signals anything exports one (panvk's gpu_queue_submit), so this has
+ * to hold everything in flight: KBASE_CSF_MAX_SUBS per group, a few groups. Filling it drains
+ * early, which shows frames before they are done. */
+#define KBASE_CSF_MAX_EXPORTS        1024
+#define KBASE_CSF_FENCE_WATCHDOG_NS  1000000000ull
+
+struct kbase_csf_export {
+   struct pan_kmod_kbase_csf_group *g;
+   uint64_t t_ns;
+   uint32_t mask;
+   uint64_t target[PAN_KMOD_KBASE_CSF_MAX_QUEUES];
+};
+
 struct kbase_csf_dev {
    pthread_mutex_t lock;
    pthread_cond_t cond;
@@ -2218,7 +2243,50 @@ struct kbase_csf_dev {
    /* The KCPU queue the submission fences come from (pan_kmod_kbase_csf_fence_fd). */
    bool kcpu_created;
    uint8_t kcpu_id;
+   /* Exports still waiting on the GPU, oldest first (see kbase_csf_fence_watchdog). */
+   struct kbase_csf_export exports[KBASE_CSF_MAX_EXPORTS];
+   unsigned nr_exports;
 };
+
+static uint64_t
+kbase_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
+/* KBASE_LOG_FILE=<path>: fault and watchdog events are also appended there and synced, so they
+ * survive what they are about (logcat does not survive a kernel panic). */
+static void PRINTFLIKE(1, 2)
+kbase_log_persist(const char *fmt, ...)
+{
+   const char *path = getenv("KBASE_LOG_FILE");
+   if (!path || !*path)
+      return;
+   char line[512];
+   va_list ap;
+   va_start(ap, fmt);
+   int n = vsnprintf(line, sizeof(line) - 1, fmt, ap);
+   va_end(ap);
+   if (n < 0)
+      return;
+   n = MIN2(n, (int)sizeof(line) - 2);
+   line[n++] = '\n';
+   const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+   if (fd < 0)
+      return;
+   char stamp[48];
+   const int s = snprintf(stamp, sizeof(stamp), "%" PRIu64 " pid %d: ", kbase_now_ns(),
+                          (int)getpid());
+   if (s > 0 && write(fd, stamp, s) < 0) {
+      close(fd);
+      return;
+   }
+   if (write(fd, line, n) >= 0)
+      fsync(fd);
+   close(fd);
+}
 
 /* KCPU queues (UAPI 1.x): the kernel runs their commands in order, so a CQS wait on the seqno
  * objects our rings signal, followed by a fence signal, gives a sync file that signals when the
@@ -2270,6 +2338,49 @@ struct base_fence {
       int stream_fd;
    } basep;
 };
+
+/* Under c->lock: drops finished exports; drains the KCPU queue if one has waited too long, its
+ * group faulted, or `why` says so. */
+static void
+kbase_csf_fence_watchdog(struct kbase_kmod_dev *kdev, struct kbase_csf_dev *c, const char *why)
+{
+   const uint64_t now = kbase_now_ns();
+   unsigned keep = 0;
+   const char *stale = why;
+   uint64_t waited = 0;
+
+   for (unsigned i = 0; i < c->nr_exports; i++) {
+      const struct kbase_csf_export *e = &c->exports[i];
+      bool done = true;
+      u_foreach_bit(q, e->mask) {
+         if (e->g->seqno[q * 8] < e->target[q])
+            done = false;
+      }
+      if (done)
+         continue;
+      if (!stale && e->g->faulted)
+         stale = "its queue group faulted";
+      if (!stale && now - e->t_ns > KBASE_CSF_FENCE_WATCHDOG_NS)
+         stale = "it waited too long";
+      waited = MAX2(waited, now - e->t_ns);
+      c->exports[keep++] = *e;
+   }
+   c->nr_exports = keep;
+
+   if (!stale || !c->kcpu_created)
+      return;
+
+   struct kbase_ioctl_kcpu_queue_delete del = {.id = c->kcpu_id};
+   const int ret = pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &del);
+   const int err = ret ? errno : 0;
+   mesa_loge("kbase: draining the fence queue (%u pending, oldest %" PRIu64 " ms): %s%s",
+             c->nr_exports, waited / 1000000, stale, err ? " -- delete failed" : "");
+   kbase_log_persist("draining the fence queue (%u pending, oldest %" PRIu64 " ms): %s, "
+                     "delete %s (err %d)",
+                     c->nr_exports, waited / 1000000, stale, err ? "failed" : "ok", err);
+   c->kcpu_created = false;
+   c->nr_exports = 0;
+}
 
 static uint64_t
 cs_ins(unsigned op, uint64_t bits)
@@ -2455,11 +2566,17 @@ kbase_csf_thread(void *arg)
                       "sideband 0x%016" PRIx64 ", queue %u",
                       handle, kind < ARRAY_SIZE(kinds) ? kinds[kind] : "unknown", kind, status,
                       status & 0xff, sideband, kind == 1 ? notes[o + 36] : 0);
+            kbase_log_persist("queue group %u: %s (type %u), status 0x%08x, sideband 0x%016" PRIx64,
+                              handle, kind < ARRAY_SIZE(kinds) ? kinds[kind] : "unknown", kind,
+                              status, sideband);
             pthread_mutex_lock(&c->lock);
             list_for_each_entry(struct pan_kmod_kbase_csf_group, g, &c->groups, link) {
                if (g->handle == handle)
                   g->faulted = true;
             }
+            /* The exported fences wait on this group's seqnos, which a faulted group never
+             * advances: drain them now rather than at the kernel's timeout. */
+            kbase_csf_fence_watchdog(kdev, c, "a queue group faulted");
             pthread_mutex_unlock(&c->lock);
          }
       }
@@ -2501,6 +2618,7 @@ kbase_csf_thread(void *arg)
          }
          n += k;
       }
+      kbase_csf_fence_watchdog(kdev, c, NULL);
       pthread_mutex_unlock(&c->lock);
 
       for (unsigned i = 0; i < n; i++) {
@@ -2667,6 +2785,21 @@ pan_kmod_kbase_csf_group_destroy(struct pan_kmod_kbase_csf_group *g)
 
    pthread_mutex_lock(&c->lock);
    list_del(&g->link);
+   /* The watchdog reads its exports' groups: anything still pending on this one is drained
+    * first, and none of its exports outlive it. */
+   bool pending = false;
+   for (unsigned i = 0; i < c->nr_exports; i++)
+      pending |= c->exports[i].g == g;
+   if (pending) {
+      g->faulted = true;
+      kbase_csf_fence_watchdog(kdev, c, "its queue group is being destroyed");
+   }
+   unsigned keep = 0;
+   for (unsigned i = 0; i < c->nr_exports; i++) {
+      if (c->exports[i].g != g)
+         c->exports[keep++] = c->exports[i];
+   }
+   c->nr_exports = keep;
    pthread_mutex_unlock(&c->lock);
 
    struct kbase_ioctl_cs_queue_group_term t = {.group_handle = g->handle};
@@ -2889,22 +3022,24 @@ pan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)
    struct base_cqs_wait_operation_info objs[PAN_KMOD_KBASE_CSF_MAX_QUEUES];
    unsigned nr_objs = 0;
 
+   /* Under the lock throughout, enqueues included (they do not block): the watchdog may delete
+    * the queue, and a KCPU queue id is reused as soon as it is free. */
    pthread_mutex_lock(&c->lock);
-   if (!c->kcpu_created) {
-      struct kbase_ioctl_kcpu_queue_new nq = {0};
-      if (pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_KCPU_QUEUE_CREATE, &nq)) {
-         pthread_mutex_unlock(&c->lock);
-         mesa_loge("kbase: KCPU_QUEUE_CREATE failed (err=%d)", errno);
-         return -1;
-      }
-      c->kcpu_id = nq.id;
-      c->kcpu_created = true;
+   /* A faulted group's seqnos never move: a wait on them would sit in the KCPU queue until the
+    * kernel's fence-signal timeout, which panics this device (kbase_csf_fence_watchdog). The
+    * work is lost either way, so there is nothing to wait for. */
+   if (g->faulted) {
+      pthread_mutex_unlock(&c->lock);
+      return -1;
    }
    /* Still pending? Then wait for every queue it signals to pass its target. */
-   for (unsigned i = 0; i < g->nr_subs; i++) {
-      const struct kbase_csf_sub *sub = &g->subs[(g->first_sub + i) % KBASE_CSF_MAX_SUBS];
-      if (sub->seq != seq)
-         continue;
+   const struct kbase_csf_sub *sub = NULL;
+   for (unsigned i = 0; i < g->nr_subs && !sub; i++) {
+      const struct kbase_csf_sub *s = &g->subs[(g->first_sub + i) % KBASE_CSF_MAX_SUBS];
+      if (s->seq == seq)
+         sub = s;
+   }
+   if (sub) {
       u_foreach_bit(q, sub->mask) {
          objs[nr_objs++] = (struct base_cqs_wait_operation_info){
             .addr = g->seq_va + q * 64,
@@ -2914,12 +3049,23 @@ pan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)
          };
       }
    }
-   const uint8_t kcpu_id = c->kcpu_id;
-   pthread_mutex_unlock(&c->lock);
    if (!nr_objs) {
+      pthread_mutex_unlock(&c->lock);
       if (getenv("KBASE_FENCE_DEBUG"))
          mesa_logi("kbase fence: seq %" PRIu64 " done already", seq);
       return -1; /* done already */
+   }
+   if (c->nr_exports == KBASE_CSF_MAX_EXPORTS)
+      kbase_csf_fence_watchdog(kdev, c, "too many fences were waiting");
+   if (!c->kcpu_created) {
+      struct kbase_ioctl_kcpu_queue_new nq = {0};
+      if (pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_KCPU_QUEUE_CREATE, &nq)) {
+         pthread_mutex_unlock(&c->lock);
+         mesa_loge("kbase: KCPU_QUEUE_CREATE failed (err=%d)", errno);
+         return -1;
+      }
+      c->kcpu_id = nq.id;
+      c->kcpu_created = true;
    }
 
    struct base_fence fence = {.basep = {.fd = -1, .stream_fd = -1}};
@@ -2931,12 +3077,23 @@ pan_kmod_kbase_csf_fence_fd(struct pan_kmod_kbase_csf_group *g, uint64_t seq)
    /* One command per enqueue: this kernel refuses more (EINVAL). */
    for (unsigned i = 0; i < 2; i++) {
       struct kbase_ioctl_kcpu_queue_enqueue enq = {
-         .addr = (uintptr_t)&cmds[i], .nr_commands = 1, .id = kcpu_id};
+         .addr = (uintptr_t)&cmds[i], .nr_commands = 1, .id = c->kcpu_id};
       if (pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq)) {
-         mesa_loge("kbase: KCPU_QUEUE_ENQUEUE failed (err=%d)", errno);
+         const int err = errno;
+         /* A wait without its signal (the second enqueue failed) would sit there until the
+          * timeout: drain it now. */
+         if (i == 1)
+            kbase_csf_fence_watchdog(kdev, c, "a fence enqueue failed");
+         pthread_mutex_unlock(&c->lock);
+         mesa_loge("kbase: KCPU_QUEUE_ENQUEUE failed (err=%d)", err);
          return -1;
       }
    }
+   /* Tracked from now: the kernel's 2 s start no earlier than the enqueue. */
+   c->exports[c->nr_exports++] = (struct kbase_csf_export){
+      .g = g, .t_ns = kbase_now_ns(), .mask = sub->mask};
+   memcpy(c->exports[c->nr_exports - 1].target, sub->target, sizeof(sub->target));
+   pthread_mutex_unlock(&c->lock);
    if (getenv("KBASE_FENCE_DEBUG"))
       mesa_logi("kbase fence: seq %" PRIu64 " objs %u fd %d", seq, nr_objs, fence.basep.fd);
    return fence.basep.fd;
