@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <dlfcn.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -638,6 +639,215 @@ kbase_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
  * pan_kmod still wants a u32 handle to key its BO table on, so one is synthesised per device.
  */
 
+/* The last allocations and frees, for one question a GPU page fault raises: was the address
+ * ours, and did we free it while the GPU could still read it? The kernel reports the faulting
+ * address with the group error (kbase_csf_ctx_handle_fault puts it in the sideband), and the
+ * event thread looks it up here (kbase_bo_history_explain). Lock-free on purpose: a torn record
+ * costs one diagnostic, a lock would cost every allocation. */
+#define KBASE_BO_HISTORY 32768
+
+struct kbase_bo_record {
+   uint64_t va, size, t_ns;
+   uint32_t flags;
+};
+
+static struct kbase_bo_record kbase_bo_allocs[KBASE_BO_HISTORY];
+static struct kbase_bo_record kbase_bo_frees[KBASE_BO_HISTORY];
+static uint32_t kbase_bo_alloc_next, kbase_bo_free_next;
+
+static uint64_t kbase_now_ns(void);
+
+static void
+kbase_bo_history_add(struct kbase_bo_record *ring, uint32_t *next, uint64_t va, uint64_t size,
+                     uint32_t flags)
+{
+   const uint32_t i = p_atomic_inc_return(next) % KBASE_BO_HISTORY;
+   ring[i] = (struct kbase_bo_record){
+      .va = va, .size = size, .t_ns = kbase_now_ns(), .flags = flags};
+}
+
+/* Writes into buf what the history knows about addr: the newest free and the newest
+ * allocation covering it, and how far back each ring reaches. */
+static void
+kbase_bo_history_explain(uint64_t addr, char *buf, size_t len)
+{
+   const uint64_t now = kbase_now_ns();
+   const struct kbase_bo_record *freed = NULL, *alloced = NULL;
+   uint64_t oldest_alloc = now, oldest_free = now;
+   for (unsigned i = 0; i < KBASE_BO_HISTORY; i++) {
+      const struct kbase_bo_record *f = &kbase_bo_frees[i];
+      if (f->size)
+         oldest_free = MIN2(oldest_free, f->t_ns);
+      if (f->size && addr >= f->va && addr - f->va < f->size &&
+          (!freed || f->t_ns > freed->t_ns))
+         freed = f;
+      const struct kbase_bo_record *a = &kbase_bo_allocs[i];
+      if (a->size)
+         oldest_alloc = MIN2(oldest_alloc, a->t_ns);
+      if (a->size && addr >= a->va && addr - a->va < a->size &&
+          (!alloced || a->t_ns > alloced->t_ns))
+         alloced = a;
+   }
+   int n = snprintf(buf, len, "address 0x%" PRIx64 ":", addr);
+   if (alloced && n > 0 && (size_t)n < len)
+      n += snprintf(buf + n, len - n,
+                    " allocated %" PRIu64 " ms ago in BO 0x%" PRIx64 "+0x%" PRIx64
+                    " (flags 0x%x);",
+                    (now - alloced->t_ns) / 1000000, alloced->va, alloced->size, alloced->flags);
+   if (freed && n > 0 && (size_t)n < len)
+      n += snprintf(buf + n, len - n,
+                    " freed %" PRIu64 " ms ago from BO 0x%" PRIx64 "+0x%" PRIx64 " (flags 0x%x)%s;",
+                    (now - freed->t_ns) / 1000000, freed->va, freed->size, freed->flags,
+                    alloced && alloced->t_ns > freed->t_ns ? ", since reallocated" : "");
+   if (!alloced && !freed && n > 0 && (size_t)n < len)
+      n += snprintf(buf + n, len - n, " in none of the last %u allocations or frees;",
+                    KBASE_BO_HISTORY);
+   if (n > 0 && (size_t)n < len)
+      snprintf(buf + n, len - n,
+               " the history reaches back %" PRIu64 " ms for allocations, %" PRIu64
+               " ms for frees",
+               (now - oldest_alloc) / 1000000, (now - oldest_free) / 1000000);
+}
+
+/* Every live mapping we made at its own GPU address (BO anchors, imports, repeated mappings),
+ * and the executable BOs, so a fault can be matched against what is alive NOW, which the history
+ * above cannot do for a BO older than its window. And, with KBASE_CHECK_ANCHORS=1, so the event
+ * thread can check that each anchor is still mapped (kbase_live_check): the kernel frees a
+ * SAME_VA region as soon as its anchor goes away, whoever unmaps it or maps over it
+ * (kbase_cpu_vm_close), and nothing tells us; the GPU then finds no region there ("Memory is
+ * not mapped on the GPU"). The process is shared with Wine and box64, which manage the address
+ * space themselves. */
+struct kbase_live_map {
+   uint64_t va, size, t_ns;
+   uintptr_t caller; /* a return address into whoever asked for it */
+   uint32_t flags;   /* PAN_KMOD_BO_FLAG_* */
+   bool anchored;    /* CPU-mapped at va, and freed when that mapping goes */
+   bool reported;    /* found gone once already */
+   char label[72];   /* what PanVK called it (bo_set_label) */
+};
+
+/* In kbase_live_map.flags: a repeated mapping (pan_kmod_kbase_bo_map_repeated) of a BO. Bit 31
+ * is PAN_KMOD_BO_FLAG_KBASE_SYNC. */
+#define KBASE_LIVE_REPEATED (1u << 30)
+
+static pthread_mutex_t kbase_live_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct kbase_live_map *kbase_live;
+static uint32_t kbase_live_count, kbase_live_cap;
+
+static void
+kbase_live_add(uint64_t va, uint64_t size, uint32_t flags, bool anchored, uintptr_t caller)
+{
+   pthread_mutex_lock(&kbase_live_lock);
+   if (kbase_live_count == kbase_live_cap) {
+      const uint32_t cap = kbase_live_cap ? kbase_live_cap * 2 : 1024;
+      struct kbase_live_map *l = realloc(kbase_live, cap * sizeof(*l));
+      if (l) {
+         kbase_live = l;
+         kbase_live_cap = cap;
+      }
+   }
+   if (kbase_live_count < kbase_live_cap)
+      kbase_live[kbase_live_count++] = (struct kbase_live_map){
+         .va = va, .size = size, .t_ns = kbase_now_ns(), .caller = caller, .flags = flags,
+         .anchored = anchored};
+   pthread_mutex_unlock(&kbase_live_lock);
+}
+
+static void
+kbase_live_remove(uint64_t va)
+{
+   pthread_mutex_lock(&kbase_live_lock);
+   for (uint32_t i = kbase_live_count; i-- > 0;) {
+      if (kbase_live[i].va == va) {
+         kbase_live[i] = kbase_live[--kbase_live_count];
+         break;
+      }
+   }
+   pthread_mutex_unlock(&kbase_live_lock);
+}
+
+/* What PanVK calls the BO at va, for the fault reports. Newest entries are at the end. */
+static void
+kbase_live_set_label(uint64_t va, const char *label)
+{
+   pthread_mutex_lock(&kbase_live_lock);
+   for (uint32_t i = kbase_live_count; i-- > 0;) {
+      if (kbase_live[i].va == va) {
+         snprintf(kbase_live[i].label, sizeof(kbase_live[i].label), "%s", label ? label : "");
+         break;
+      }
+   }
+   pthread_mutex_unlock(&kbase_live_lock);
+}
+
+/* "libvulkan_panfrost.so+0x1234", for llvm-addr2line on the unstripped build. */
+static void
+kbase_format_code_addr(uintptr_t pc, char *buf, size_t len)
+{
+   Dl_info info;
+   if (pc && dladdr((void *)pc, &info) && info.dli_fname) {
+      const char *base = strrchr(info.dli_fname, '/');
+      snprintf(buf, len, "%s+0x%" PRIxPTR, base ? base + 1 : info.dli_fname,
+               pc - (uintptr_t)info.dli_fbase);
+   } else {
+      snprintf(buf, len, "0x%" PRIxPTR, pc);
+   }
+}
+
+/* Writes into buf what is alive at addr now: the live mapping covering it, or else the nearest
+ * one on each side. */
+static void
+kbase_live_explain(uint64_t addr, char *buf, size_t len)
+{
+   const uint64_t now = kbase_now_ns();
+   struct kbase_live_map hit = {0}, below = {0}, above = {0};
+   bool has_hit = false, has_below = false, has_above = false;
+   pthread_mutex_lock(&kbase_live_lock);
+   const uint32_t count = kbase_live_count;
+   for (uint32_t i = 0; i < kbase_live_count; i++) {
+      const struct kbase_live_map *m = &kbase_live[i];
+      if (addr >= m->va && addr - m->va < m->size) {
+         hit = *m;
+         has_hit = true;
+      } else if (m->va < addr) {
+         if (!has_below || m->va > below.va) {
+            below = *m;
+            has_below = true;
+         }
+      } else if (!has_above || m->va < above.va) {
+         above = *m;
+         has_above = true;
+      }
+   }
+   pthread_mutex_unlock(&kbase_live_lock);
+
+   char site[96];
+   if (has_hit) {
+      kbase_format_code_addr(hit.caller, site, sizeof(site));
+      snprintf(buf, len,
+               "inside LIVE mapping 0x%" PRIx64 "+0x%" PRIx64 " \"%s\" (flags 0x%x, made %" PRIu64
+               " ms ago from %s)%s",
+               hit.va, hit.size, hit.label, hit.flags, (now - hit.t_ns) / 1000000, site,
+               hit.anchored ? ", which we never released: something else removed it" : "");
+      return;
+   }
+   int n = snprintf(buf, len, "in none of our %u live mappings", count);
+   if (has_below && n > 0 && (size_t)n < len) {
+      kbase_format_code_addr(below.caller, site, sizeof(site));
+      n += snprintf(buf + n, len - n,
+                    "; below it 0x%" PRIx64 "+0x%" PRIx64 " (flags 0x%x, from %s), which ends 0x%" PRIx64
+                    " before",
+                    below.va, below.size, below.flags, site, addr - (below.va + below.size));
+   }
+   if (has_above && n > 0 && (size_t)n < len) {
+      kbase_format_code_addr(above.caller, site, sizeof(site));
+      snprintf(buf + n, len - n,
+               "; above it 0x%" PRIx64 "+0x%" PRIx64 " (flags 0x%x, from %s), 0x%" PRIx64
+               " after",
+               above.va, above.size, above.flags, site, above.va - addr);
+   }
+}
+
 static struct pan_kmod_bo *
 kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, uint64_t size,
                     uint32_t flags)
@@ -715,6 +925,8 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
 
    pan_kmod_bo_init(&bo->base, dev, exclusive_vm, pages * 4096, flags,
                     p_atomic_inc_return(&kbase_dev->next_handle));
+   kbase_bo_history_add(kbase_bo_allocs, &kbase_bo_alloc_next, bo->gpu_va, pages * 4096, flags);
+   kbase_live_add(bo->gpu_va, pages * 4096, flags, !exec, (uintptr_t)__builtin_return_address(0));
    return &bo->base;
 }
 
@@ -722,6 +934,12 @@ static void
 kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 {
    struct kbase_kmod_bo *kbase_bo = container_of(bo, struct kbase_kmod_bo, base);
+
+   /* Out of the live table before the anchor goes, so the anchor check never sees our own
+    * release as someone else's. */
+   kbase_live_remove(kbase_bo->gpu_va);
+   kbase_bo_history_add(kbase_bo_frees, &kbase_bo_free_next, kbase_bo->gpu_va, bo->size,
+                        bo->flags);
 
    if (kbase_bo->exec) {
       struct kbase_ioctl_mem_free req = {.gpu_addr = kbase_bo->gpu_va};
@@ -735,6 +953,12 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
    }
 
    pan_kmod_dev_free(bo->dev, kbase_bo);
+}
+
+static void
+kbase_kmod_bo_set_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label)
+{
+   kbase_live_set_label(container_of(bo, struct kbase_kmod_bo, base)->gpu_va, label);
 }
 
 static void *
@@ -828,6 +1052,10 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
    bo->gpu_va = (uint64_t)(uintptr_t)anchor;
    pan_kmod_bo_init(&bo->base, dev, NULL, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED,
                     p_atomic_inc_return(&kbase_dev->next_handle));
+   kbase_bo_history_add(kbase_bo_allocs, &kbase_bo_alloc_next, bo->gpu_va, pages * 4096,
+                        PAN_KMOD_BO_FLAG_IMPORTED);
+   kbase_live_add(bo->gpu_va, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED, true,
+                  (uintptr_t)__builtin_return_address(0));
 
    struct pan_kmod_bo **slot = util_sparse_array_get(&dev->handle_to_bo.array, bo->base.handle);
    if (!slot) {
@@ -2011,6 +2239,8 @@ pan_kmod_kbase_bo_map_repeated(struct pan_kmod_bo *bo, unsigned count, uint64_t 
       munmap(p, size);
       return 0;
    }
+   kbase_live_add((uint64_t)(uintptr_t)p, size, bo->flags | KBASE_LIVE_REPEATED, true,
+                  (uintptr_t)__builtin_return_address(0));
    return (uint64_t)(uintptr_t)p;
 }
 
@@ -2018,6 +2248,7 @@ void
 pan_kmod_kbase_unmap_repeated(struct pan_kmod_bo *bo, uint64_t va, unsigned count)
 {
    /* As for any SAME_VA region, dropping the mapping frees the alias. */
+   kbase_live_remove(va);
    munmap((void *)(uintptr_t)va, bo->size * kbase_repeat_count(bo->size, count));
 }
 
@@ -2288,6 +2519,390 @@ kbase_log_persist(const char *fmt, ...)
    close(fd);
 }
 
+/* /proc/self/maps, whole and NUL-terminated (free() it), or NULL. */
+static char *
+kbase_read_maps(void)
+{
+   const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+   if (fd < 0)
+      return NULL;
+   size_t cap = 256 * 1024, len = 0;
+   char *buf = malloc(cap);
+   while (buf) {
+      if (cap - len < 64 * 1024) {
+         char *b = realloc(buf, cap * 2);
+         if (!b) {
+            free(buf);
+            buf = NULL;
+            break;
+         }
+         buf = b;
+         cap *= 2;
+      }
+      const ssize_t r = read(fd, buf + len, cap - len - 1);
+      if (r <= 0)
+         break;
+      len += r;
+   }
+   close(fd);
+   if (buf)
+      buf[len] = '\0';
+   return buf;
+}
+
+/* One /proc/self/maps line: "start-end perms offset dev inode path". */
+struct kbase_maps_line {
+   uint64_t start, end, offset;
+   const char *text;
+};
+
+static bool
+kbase_parse_maps_line(const char *line, struct kbase_maps_line *out)
+{
+   unsigned long long s, e, off;
+   if (sscanf(line, "%llx-%llx %*s %llx", &s, &e, &off) != 3)
+      return false;
+   *out = (struct kbase_maps_line){.start = s, .end = e, .offset = off, .text = line};
+   return true;
+}
+
+/* Logs the /proc/self/maps lines overlapping [lo, hi), at most max of them. */
+static void
+kbase_log_maps_range(uint64_t lo, uint64_t hi, unsigned max)
+{
+   char *text = kbase_read_maps();
+   if (!text) {
+      mesa_loge("kbase: could not read /proc/self/maps (err=%d)", errno);
+      return;
+   }
+   unsigned shown = 0;
+   for (char *line = text; *line && shown < max;) {
+      char *nl = strchr(line, '\n');
+      if (nl)
+         *nl = '\0';
+      struct kbase_maps_line m;
+      if (kbase_parse_maps_line(line, &m) && m.start < hi && m.end > lo) {
+         mesa_loge("kbase:   maps: %s", line);
+         kbase_log_persist("  maps: %s", line);
+         shown++;
+      }
+      if (!nl)
+         break;
+      line = nl + 1;
+   }
+   if (!shown) {
+      mesa_loge("kbase:   maps: nothing between 0x%" PRIx64 " and 0x%" PRIx64, lo, hi);
+      kbase_log_persist("  maps: nothing between 0x%" PRIx64 " and 0x%" PRIx64, lo, hi);
+   }
+   free(text);
+}
+
+/* Whether maps[k...] is still the anchor of [va, va + size): kbase's node, mapped at the
+ * region's own GPU address (kbase sets a SAME_VA mapping's page offset to its region's start,
+ * so offset == start), over the whole range. Another mapping of ours that landed on top of it
+ * (a placed vkMapMemory of a different BO, say) fails the offset test. */
+static bool
+kbase_maps_is_anchor(const struct kbase_maps_line *maps, uint32_t nr, uint32_t k, uint64_t va,
+                     uint64_t size)
+{
+   uint64_t end = va;
+   for (; k < nr && maps[k].start <= end; k++) {
+      if (!strstr(maps[k].text, "/dev/mali") || maps[k].offset != maps[k].start)
+         return false;
+      end = MAX2(end, maps[k].end);
+      if (end >= va + size)
+         return true;
+   }
+   return false;
+}
+
+/* KBASE_CHECK_ANCHORS=1: called every couple of seconds by the event thread, checks that each
+ * anchored live mapping is still the mapping we made. One that is not was unmapped or mapped
+ * over by someone else in the process, and the kernel freed its region with it. Reported once
+ * each, with what holds the address now. */
+static void
+kbase_live_check(void)
+{
+   static unsigned runs;
+   const uint64_t t0 = kbase_now_ns();
+   char *text = kbase_read_maps();
+   if (!text)
+      return;
+
+   uint32_t nr = 0, cap = 4096;
+   struct kbase_maps_line *maps = malloc(cap * sizeof(*maps));
+   for (char *line = text; maps && *line;) {
+      char *nl = strchr(line, '\n');
+      if (nl)
+         *nl = '\0';
+      if (nr == cap) {
+         struct kbase_maps_line *m = realloc(maps, 2 * cap * sizeof(*maps));
+         if (!m) {
+            free(maps);
+            maps = NULL;
+            break;
+         }
+         maps = m;
+         cap *= 2;
+      }
+      if (kbase_parse_maps_line(line, &maps[nr]))
+         nr++;
+      if (!nl)
+         break;
+      line = nl + 1;
+   }
+   if (!maps) {
+      free(text);
+      return;
+   }
+
+   struct kbase_live_map gone[8];
+   const char *gone_now[8];
+   unsigned nr_gone = 0;
+   uint32_t checked = 0;
+   uint64_t lowest = UINT64_MAX, highest = 0;
+   pthread_mutex_lock(&kbase_live_lock);
+   for (uint32_t i = 0; i < kbase_live_count; i++) {
+      struct kbase_live_map *l = &kbase_live[i];
+      /* Made after the snapshot was read: not in it. */
+      if (!l->anchored || l->reported || l->t_ns >= t0)
+         continue;
+      checked++;
+      lowest = MIN2(lowest, l->va);
+      highest = MAX2(highest, l->va + l->size);
+      /* The first line ending above va: the one holding it, if any. The lines are sorted and
+       * do not overlap. */
+      uint32_t lo = 0, hi = nr;
+      while (lo < hi) {
+         const uint32_t mid = lo + (hi - lo) / 2;
+         if (maps[mid].end <= l->va)
+            lo = mid + 1;
+         else
+            hi = mid;
+      }
+      if (lo < nr && maps[lo].start <= l->va &&
+          kbase_maps_is_anchor(maps, nr, lo, l->va, l->size))
+         continue;
+      l->reported = true;
+      if (nr_gone < ARRAY_SIZE(gone)) {
+         gone[nr_gone] = *l;
+         gone_now[nr_gone] = lo < nr && maps[lo].start < l->va + l->size ? maps[lo].text : NULL;
+         nr_gone++;
+      }
+   }
+   pthread_mutex_unlock(&kbase_live_lock);
+
+   const uint64_t ms = (kbase_now_ns() - t0) / 1000000;
+   if (runs++ % 30 == 0) {
+      mesa_logw("kbase: anchor check: %u live mappings between 0x%" PRIx64 " and 0x%" PRIx64
+                ", %u maps lines, %" PRIu64 " ms",
+                checked, lowest, highest, nr, ms);
+      kbase_log_persist("anchor check: %u live mappings between 0x%" PRIx64 " and 0x%" PRIx64
+                        ", %u maps lines, %" PRIu64 " ms",
+                        checked, lowest, highest, nr, ms);
+   }
+   for (unsigned i = 0; i < nr_gone; i++) {
+      char site[96];
+      kbase_format_code_addr(gone[i].caller, site, sizeof(site));
+      const uint64_t age = (t0 - gone[i].t_ns) / 1000000;
+      mesa_loge("kbase: our mapping 0x%" PRIx64 "+0x%" PRIx64 " (flags 0x%x, made %" PRIu64
+                " ms ago from %s) is GONE, and its GPU memory with it; there now: %s",
+                gone[i].va, gone[i].size, gone[i].flags, age, site,
+                gone_now[i] ? gone_now[i] : "nothing");
+      kbase_log_persist("our mapping 0x%" PRIx64 "+0x%" PRIx64 " (flags 0x%x, made %" PRIu64
+                        " ms ago from %s) is GONE; there now: %s",
+                        gone[i].va, gone[i].size, gone[i].flags, age, site,
+                        gone_now[i] ? gone_now[i] : "nothing");
+   }
+   free(maps);
+   free(text);
+}
+
+/* A CPU view of one of our regions: a mapping of the kbase node that is NOT at its region's own
+ * address (offset != start), which is what bo_mmap hands PanVK. Its offset is the region's GPU
+ * address. The GPU has nothing at a view's addresses, so a view address in GPU hands is a CPU
+ * pointer that was written where a GPU address belongs. */
+struct kbase_cpu_view {
+   uint64_t start, end, gpu;
+};
+
+/* Our CPU views from /proc/self/maps, sorted by start (malloc'ed; free() it). */
+static uint32_t
+kbase_read_cpu_views(struct kbase_cpu_view **out)
+{
+   *out = NULL;
+   char *text = kbase_read_maps();
+   if (!text)
+      return 0;
+   uint32_t n = 0, cap = 1024;
+   struct kbase_cpu_view *v = malloc(cap * sizeof(*v));
+   for (char *line = text; v && *line;) {
+      char *nl = strchr(line, '\n');
+      if (nl)
+         *nl = '\0';
+      struct kbase_maps_line m;
+      if (kbase_parse_maps_line(line, &m) && m.offset != m.start && strstr(line, "/dev/mali")) {
+         if (n == cap) {
+            struct kbase_cpu_view *g = realloc(v, 2 * cap * sizeof(*v));
+            if (!g) {
+               free(v);
+               v = NULL;
+               break;
+            }
+            v = g;
+            cap *= 2;
+         }
+         v[n++] = (struct kbase_cpu_view){.start = m.start, .end = m.end, .gpu = m.offset};
+      }
+      if (!nl)
+         break;
+      line = nl + 1;
+   }
+   free(text);
+   *out = v;
+   return v ? n : 0;
+}
+
+static const struct kbase_cpu_view *
+kbase_find_cpu_view(const struct kbase_cpu_view *v, uint32_t n, uint64_t addr)
+{
+   uint32_t lo = 0, hi = n;
+   while (lo < hi) {
+      const uint32_t mid = lo + (hi - lo) / 2;
+      if (v[mid].end <= addr)
+         lo = mid + 1;
+      else
+         hi = mid;
+   }
+   return lo < n && v[lo].start <= addr ? &v[lo] : NULL;
+}
+
+/* Says whether a GPU fault address is one of our CPU views, i.e. a CPU pointer that the GPU was
+ * given as an address. */
+static void
+kbase_explain_cpu_view(uint64_t addr)
+{
+   struct kbase_cpu_view *views;
+   const uint32_t nv = kbase_read_cpu_views(&views);
+   const struct kbase_cpu_view *v = kbase_find_cpu_view(views, nv, addr);
+   if (v) {
+      mesa_loge("kbase: fault address 0x%" PRIx64 " is our CPU VIEW 0x%" PRIx64 "-0x%" PRIx64
+                " of the region at GPU 0x%" PRIx64 " (+0x%" PRIx64 "): a CPU pointer was used as"
+                " a GPU address; its GPU address would be 0x%" PRIx64,
+                addr, v->start, v->end, v->gpu, addr - v->start, v->gpu + (addr - v->start));
+      kbase_log_persist("fault address 0x%" PRIx64 " is our CPU VIEW 0x%" PRIx64 "-0x%" PRIx64
+                        " of the region at GPU 0x%" PRIx64 " (+0x%" PRIx64 "): a CPU pointer was"
+                        " used as a GPU address; its GPU address would be 0x%" PRIx64,
+                        addr, v->start, v->end, v->gpu, addr - v->start,
+                        v->gpu + (addr - v->start));
+   } else {
+      mesa_loge("kbase: fault address 0x%" PRIx64 " is in none of our %u CPU views", addr, nv);
+      kbase_log_persist("fault address 0x%" PRIx64 " is in none of our %u CPU views", addr, nv);
+   }
+   free(views);
+}
+
+/* Reads every live BO PanVK writes from the CPU, looking for 64-bit words whose low 48 bits are
+ * an address inside one of our CPU views: a CPU pointer stored where the GPU will take it for a
+ * GPU address (a descriptor, a command stream immediate). Words pointing within 64 KiB of near
+ * are reported first. Holds kbase_live_lock while reading, so nothing is released under it;
+ * meant for after a fault, when the device is lost anyway. */
+static void
+kbase_scan_cpu_pointers(uint64_t near)
+{
+   struct kbase_cpu_view *views;
+   const uint32_t nv = kbase_read_cpu_views(&views);
+   if (!nv) {
+      free(views);
+      return;
+   }
+
+   struct hit {
+      uint64_t bo_va, bo_size, off, word, view_gpu, view_off;
+      uint64_t ctx[6];
+      uint32_t flags;
+      uintptr_t caller;
+      bool near;
+   } hits[16];
+   unsigned nr_hits = 0, total = 0, total_near = 0;
+   uint64_t scanned = 0;
+   const uint64_t t0 = kbase_now_ns();
+   /* Not worth reading: no CPU writes (NO_MMAP), only partly backed (ALLOC_ON_FAULT, a read past
+    * the backing faults), somebody else's (IMPORTED), our own sync objects and second mappings. */
+   const uint32_t skip = PAN_KMOD_BO_FLAG_NO_MMAP | PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT |
+                         PAN_KMOD_BO_FLAG_IMPORTED | PAN_KMOD_BO_FLAG_EXECUTABLE |
+                         PAN_KMOD_BO_FLAG_KBASE_SYNC | KBASE_LIVE_REPEATED;
+
+   pthread_mutex_lock(&kbase_live_lock);
+   for (uint32_t i = 0; i < kbase_live_count && scanned < (1ull << 30); i++) {
+      const struct kbase_live_map *l = &kbase_live[i];
+      if (!l->anchored || (l->flags & skip) || l->size > (4u << 20))
+         continue;
+      const uint64_t *w = (const uint64_t *)(uintptr_t)l->va;
+      const uint64_t nw = l->size / 8;
+      for (uint64_t k = 0; k < nw; k++) {
+         const uint64_t a = w[k] & 0xffffffffffffull;
+         if (a < views[0].start || a >= views[nv - 1].end)
+            continue;
+         const struct kbase_cpu_view *v = kbase_find_cpu_view(views, nv, a);
+         if (!v)
+            continue;
+         const bool is_near = near && a + 0x10000 > near && a < near + 0x10000;
+         total++;
+         total_near += is_near;
+         /* Once the table is full, a near one replaces one that is not. */
+         unsigned slot = nr_hits;
+         if (slot == ARRAY_SIZE(hits)) {
+            if (!is_near)
+               continue;
+            for (slot = 0; slot < ARRAY_SIZE(hits) && hits[slot].near; slot++)
+               ;
+            if (slot == ARRAY_SIZE(hits))
+               continue;
+         } else {
+            nr_hits++;
+         }
+         struct hit *h = &hits[slot];
+         *h = (struct hit){.bo_va = l->va, .bo_size = l->size, .off = k * 8, .word = a,
+                           .view_gpu = v->gpu, .view_off = a - v->start, .flags = l->flags,
+                           .caller = l->caller, .near = is_near};
+         for (unsigned c = 0; c < 6; c++) {
+            const int64_t j = (int64_t)k - 2 + c;
+            h->ctx[c] = j >= 0 && (uint64_t)j < nw ? w[j] : 0;
+         }
+      }
+      scanned += l->size;
+   }
+   pthread_mutex_unlock(&kbase_live_lock);
+
+   const uint64_t ms = (kbase_now_ns() - t0) / 1000000;
+   mesa_loge("kbase: CPU pointer scan: %u word(s) hold one of our CPU view addresses (%u near "
+             "0x%" PRIx64 "), %" PRIu64 " MB read in %" PRIu64 " ms",
+             total, total_near, near, scanned >> 20, ms);
+   kbase_log_persist("CPU pointer scan: %u word(s) hold one of our CPU view addresses (%u near "
+                     "0x%" PRIx64 "), %" PRIu64 " MB read in %" PRIu64 " ms",
+                     total, total_near, near, scanned >> 20, ms);
+   for (unsigned i = 0; i < nr_hits; i++) {
+      const struct hit *h = &hits[i];
+      char site[96];
+      kbase_format_code_addr(h->caller, site, sizeof(site));
+      mesa_loge("kbase:   0x%" PRIx64 " (CPU view of GPU 0x%" PRIx64 " +0x%" PRIx64 ") at BO "
+                "0x%" PRIx64 "+0x%" PRIx64 " (size 0x%" PRIx64 ", flags 0x%x, from %s); words "
+                "%016" PRIx64 " %016" PRIx64 " [%016" PRIx64 "] %016" PRIx64 " %016" PRIx64
+                " %016" PRIx64,
+                h->word, h->view_gpu, h->view_off, h->bo_va, h->off, h->bo_size, h->flags, site,
+                h->ctx[0], h->ctx[1], h->ctx[2], h->ctx[3], h->ctx[4], h->ctx[5]);
+      kbase_log_persist("  0x%" PRIx64 " (CPU view of GPU 0x%" PRIx64 " +0x%" PRIx64 ") at BO "
+                        "0x%" PRIx64 "+0x%" PRIx64 " (size 0x%" PRIx64 ", flags 0x%x, from %s); "
+                        "words %016" PRIx64 " %016" PRIx64 " [%016" PRIx64 "] %016" PRIx64
+                        " %016" PRIx64 " %016" PRIx64,
+                        h->word, h->view_gpu, h->view_off, h->bo_va, h->off, h->bo_size,
+                        h->flags, site, h->ctx[0], h->ctx[1], h->ctx[2], h->ctx[3], h->ctx[4],
+                        h->ctx[5]);
+   }
+   free(views);
+}
+
 /* KCPU queues (UAPI 1.x): the kernel runs their commands in order, so a CQS wait on the seqno
  * objects our rings signal, followed by a fence signal, gives a sync file that signals when the
  * GPU is done with a submission, with no CPU wait. */
@@ -2531,8 +3146,30 @@ kbase_csf_thread(void *arg)
    /* KBASE_CSF_DEBUG=1: the state of every ring about once a second while work is pending. */
    const bool dbg = debug_get_bool_option("KBASE_CSF_DEBUG", false);
    unsigned polls = 0;
+   /* KBASE_CHECK_ANCHORS=1: check our anchors every 2 s (kbase_live_check); KBASE_SCAN_PTRS=1:
+    * scan for CPU pointers every 5 s (kbase_scan_cpu_pointers). Both run here, on the thread that
+    * completes submissions, and both cost time with many BOs (the anchor check took 53 ms with
+    * 11600 mappings in Deep Rock Galactic), so neither comes with KBASE_LOG_FILE. */
+   const bool check_anchors = debug_get_bool_option("KBASE_CHECK_ANCHORS", false);
+   const bool scan_ptrs = debug_get_bool_option("KBASE_SCAN_PTRS", false);
+   uint64_t next_check = 0, next_scan = kbase_now_ns() + 5000000000ull;
 
    for (;;) {
+      if (check_anchors) {
+         const uint64_t now = kbase_now_ns();
+         if (now >= next_check) {
+            kbase_live_check();
+            next_check = now + 2000000000ull;
+         }
+      }
+      if (scan_ptrs) {
+         const uint64_t now = kbase_now_ns();
+         if (now >= next_scan) {
+            kbase_scan_cpu_pointers(0);
+            next_scan = now + 5000000000ull;
+         }
+      }
+
       pthread_mutex_lock(&c->lock);
       bool busy = false;
       list_for_each_entry(struct pan_kmod_kbase_csf_group, g, &c->groups, link)
@@ -2569,6 +3206,24 @@ kbase_csf_thread(void *arg)
             kbase_log_persist("queue group %u: %s (type %u), status 0x%08x, sideband 0x%016" PRIx64,
                               handle, kind < ARRAY_SIZE(kinds) ? kinds[kind] : "unknown", kind,
                               status, sideband);
+            /* A group fault's sideband is the faulting GPU address (kbase_csf_ctx_handle_fault):
+             * say whether it was ours, and whether we had freed it. */
+            if (kind == 0 && sideband) {
+               char what[480];
+               kbase_bo_history_explain(sideband, what, sizeof(what));
+               mesa_loge("kbase: fault %s", what);
+               kbase_log_persist("fault %s", what);
+               kbase_live_explain(sideband, what, sizeof(what));
+               mesa_loge("kbase: fault address now: %s", what);
+               kbase_log_persist("fault address now: %s", what);
+               const uint64_t around = 256ull << 10;
+               kbase_log_maps_range(sideband > around ? sideband - around : 0,
+                                    sideband + around, 16);
+               /* Before the group is marked faulted: until then nothing completes, so the
+                * command buffers that faulted are still intact for the scan. */
+               kbase_explain_cpu_view(sideband);
+               kbase_scan_cpu_pointers(sideband);
+            }
             pthread_mutex_lock(&c->lock);
             list_for_each_entry(struct pan_kmod_kbase_csf_group, g, &c->groups, link) {
                if (g->handle == handle)
@@ -3135,6 +3790,7 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .bo_import = kbase_kmod_bo_import,
    .bo_export = kbase_kmod_bo_export,
    .bo_mmap = kbase_kmod_bo_mmap,
+   .bo_set_label = kbase_kmod_bo_set_label,
    .bo_wait = kbase_kmod_bo_wait,
    .vm_create = kbase_kmod_vm_create,
    .vm_destroy = kbase_kmod_vm_destroy,
