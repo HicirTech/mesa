@@ -17,6 +17,7 @@ bit_block(bi_context *ctx)
    bi_block *blk = rzalloc(ctx, bi_block);
 
    util_dynarray_init(&blk->predecessors, blk);
+   _mesa_pointer_set_init(&blk->dom_frontier, ctx);
    list_addtail(&blk->link, &ctx->blocks);
    list_inithead(&blk->instructions);
 
