@@ -304,6 +304,8 @@ struct kbase_kmod_bo {
    /* The mapping that FIXES gpu_va for an ordinary (SAME_VA) allocation, and whose lifetime is
     * the allocation's. NULL for an executable one, whose address comes from the kernel. */
    void *anchor;
+   /* The anchor's length: the BO's, plus its guard page (kbase_guard_mode). */
+   uint64_t anchor_size;
    bool exec;
 };
 
@@ -722,6 +724,7 @@ struct kbase_live_map {
    uintptr_t caller; /* a return address into whoever asked for it */
    uint32_t flags;   /* PAN_KMOD_BO_FLAG_* */
    bool anchored;    /* CPU-mapped at va, and freed when that mapping goes */
+   bool guard;       /* followed by a reserved, unbacked page (KBASE_GUARD_PAGES=detect) */
    bool reported;    /* found gone once already */
    char label[72];   /* what PanVK called it (bo_set_label) */
 };
@@ -735,7 +738,8 @@ static struct kbase_live_map *kbase_live;
 static uint32_t kbase_live_count, kbase_live_cap;
 
 static void
-kbase_live_add(uint64_t va, uint64_t size, uint32_t flags, bool anchored, uintptr_t caller)
+kbase_live_add(uint64_t va, uint64_t size, uint32_t flags, bool anchored, bool guard,
+               uintptr_t caller)
 {
    pthread_mutex_lock(&kbase_live_lock);
    if (kbase_live_count == kbase_live_cap) {
@@ -749,7 +753,7 @@ kbase_live_add(uint64_t va, uint64_t size, uint32_t flags, bool anchored, uintpt
    if (kbase_live_count < kbase_live_cap)
       kbase_live[kbase_live_count++] = (struct kbase_live_map){
          .va = va, .size = size, .t_ns = kbase_now_ns(), .caller = caller, .flags = flags,
-         .anchored = anchored};
+         .anchored = anchored, .guard = guard};
    pthread_mutex_unlock(&kbase_live_lock);
 }
 
@@ -795,13 +799,16 @@ kbase_format_code_addr(uintptr_t pc, char *buf, size_t len)
 }
 
 /* Writes into buf what is alive at addr now: the live mapping covering it, or else the nearest
- * one on each side. */
+ * one on each side. For an address in the guard page after a BO, tail gets that BO's last 128
+ * bytes as 64-bit words (empty otherwise): what was being read past. */
 static void
-kbase_live_explain(uint64_t addr, char *buf, size_t len)
+kbase_live_explain(uint64_t addr, char *buf, size_t len, char *tail, size_t tail_len)
 {
    const uint64_t now = kbase_now_ns();
    struct kbase_live_map hit = {0}, below = {0}, above = {0};
    bool has_hit = false, has_below = false, has_above = false;
+   uint64_t words[16];
+   unsigned nr_words = 0;
    pthread_mutex_lock(&kbase_live_lock);
    const uint32_t count = kbase_live_count;
    for (uint32_t i = 0; i < kbase_live_count; i++) {
@@ -819,7 +826,22 @@ kbase_live_explain(uint64_t addr, char *buf, size_t len)
          has_above = true;
       }
    }
+   const bool in_guard = !has_hit && has_below && below.guard &&
+                         addr - (below.va + below.size) < 4096;
+   if (in_guard && below.anchored) {
+      /* Still under the lock, so the BO cannot be released while it is read. */
+      nr_words = MIN2(below.size, sizeof(words)) / 8;
+      memcpy(words, (const uint8_t *)(uintptr_t)(below.va + below.size - nr_words * 8),
+             nr_words * 8);
+   }
    pthread_mutex_unlock(&kbase_live_lock);
+
+   if (tail && tail_len) {
+      tail[0] = '\0';
+      int t = 0;
+      for (unsigned i = 0; i < nr_words && t >= 0 && (size_t)t < tail_len; i++)
+         t += snprintf(tail + t, tail_len - t, "%s%016" PRIx64, i ? " " : "", words[i]);
+   }
 
    char site[96];
    if (has_hit) {
@@ -829,6 +851,15 @@ kbase_live_explain(uint64_t addr, char *buf, size_t len)
                " ms ago from %s)%s",
                hit.va, hit.size, hit.label, hit.flags, (now - hit.t_ns) / 1000000, site,
                hit.anchored ? ", which we never released: something else removed it" : "");
+      return;
+   }
+   if (in_guard) {
+      kbase_format_code_addr(below.caller, site, sizeof(site));
+      snprintf(buf, len,
+               "in the GUARD page after live BO 0x%" PRIx64 "+0x%" PRIx64 " \"%s\" (flags 0x%x, made %"
+               PRIu64 " ms ago from %s): an access 0x%" PRIx64 " past that BO's end",
+               below.va, below.size, below.label, below.flags, (now - below.t_ns) / 1000000, site,
+               addr - (below.va + below.size));
       return;
    }
    int n = snprintf(buf, len, "in none of our %u live mappings", count);
@@ -848,6 +879,35 @@ kbase_live_explain(uint64_t addr, char *buf, size_t len)
    }
 }
 
+/* One extra page after every ordinary BO, never used by PanVK. Something in Deep Rock
+ * Galactic's render passes has the GPU read a little past the end of a command buffer
+ * allocation that sits at the very end of its 64 KiB slab. On panthor BOs sit back to back in
+ * the GPU address space and such a read lands in the next BO unnoticed; here the next page is
+ * usually a CPU view (bo_mmap) the GPU cannot see, and the read kills the queue group.
+ * KBASE_GUARD_PAGES picks what the page is:
+ *   absorb (the default): committed, so the read finds zeros, as harmless as on panthor;
+ *   detect (or 1): reserved but never backed, so the read faults inside this BO's own region
+ *     ("Memory is not growable") and the fault report names the BO and dumps its end;
+ *   off (or 0): no page. */
+enum kbase_guard {
+   KBASE_GUARD_OFF,
+   KBASE_GUARD_ABSORB,
+   KBASE_GUARD_DETECT,
+};
+
+static enum kbase_guard
+kbase_guard_mode(void)
+{
+   static int mode = -1;
+   if (mode < 0) {
+      const char *s = debug_get_option("KBASE_GUARD_PAGES", "absorb");
+      mode = !strcmp(s, "detect") || !strcmp(s, "1")  ? KBASE_GUARD_DETECT
+             : !strcmp(s, "off") || !strcmp(s, "0") ? KBASE_GUARD_OFF
+                                                      : KBASE_GUARD_ABSORB;
+   }
+   return mode;
+}
+
 static struct pan_kmod_bo *
 kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, uint64_t size,
                     uint32_t flags)
@@ -862,6 +922,10 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
 
    const bool exec = flags & PAN_KMOD_BO_FLAG_EXECUTABLE;
    const bool grow = !exec && (flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT);
+   const enum kbase_guard gmode = !exec && !grow && !(flags & PAN_KMOD_BO_FLAG_KBASE_SYNC)
+                                     ? kbase_guard_mode()
+                                     : KBASE_GUARD_OFF;
+   const bool guard = gmode != KBASE_GUARD_OFF;
 
    struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
    if (!bo)
@@ -870,8 +934,9 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
    const uint64_t pages = DIV_ROUND_UP(size, 4096);
    union kbase_ioctl_mem_alloc req = {
       .in = {
-         .va_pages = pages,
-         .commit_pages = grow ? MIN2(pages, KBASE_GROW_INITIAL_PAGES) : pages,
+         .va_pages = pages + guard,
+         .commit_pages = grow ? MIN2(pages, KBASE_GROW_INITIAL_PAGES)
+                              : pages + (gmode == KBASE_GUARD_ABSORB),
          .extension = grow ? KBASE_GROW_STEP_PAGES : 0,
          .flags = exec ? KBASE_MEM_FLAGS_EXEC
                        : KBASE_MEM_FLAGS_RW | (grow ? BASE_MEM_GROW_ON_GPF : 0) |
@@ -910,8 +975,10 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
    } else {
       /* req.out.gpu_va is a cookie. Spend it on the anchor, and the address that comes back is
        * the GPU VA. The anchor is never unmapped before bo_free, because unmapping it frees the
-       * allocation. */
-      void *anchor = mmap(NULL, pages * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
+       * allocation. It must cover the whole reservation, guard page included (kbase refuses a
+       * cookie mapping of any other length). */
+      bo->anchor_size = (pages + guard) * 4096;
+      void *anchor = mmap(NULL, bo->anchor_size, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
                           (off_t)req.out.gpu_va);
       if (anchor == MAP_FAILED) {
          mesa_loge("kbase: could not map the anchor for cookie 0x%" PRIx64 " (err=%d)",
@@ -926,7 +993,8 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
    pan_kmod_bo_init(&bo->base, dev, exclusive_vm, pages * 4096, flags,
                     p_atomic_inc_return(&kbase_dev->next_handle));
    kbase_bo_history_add(kbase_bo_allocs, &kbase_bo_alloc_next, bo->gpu_va, pages * 4096, flags);
-   kbase_live_add(bo->gpu_va, pages * 4096, flags, !exec, (uintptr_t)__builtin_return_address(0));
+   kbase_live_add(bo->gpu_va, pages * 4096, flags, !exec, gmode == KBASE_GUARD_DETECT,
+                  (uintptr_t)__builtin_return_address(0));
    return &bo->base;
 }
 
@@ -947,7 +1015,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
          mesa_loge("kbase: MEM_FREE(0x%" PRIx64 ") failed (err=%d)", kbase_bo->gpu_va, errno);
    } else if (kbase_bo->anchor) {
       /* Dropping the anchor IS the free for a SAME_VA region. MEM_FREE refuses these. */
-      if (munmap(kbase_bo->anchor, bo->size))
+      if (munmap(kbase_bo->anchor, kbase_bo->anchor_size))
          mesa_loge("kbase: releasing the anchor at %p failed (err=%d)", kbase_bo->anchor, errno);
 
    }
@@ -1049,12 +1117,13 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
 
    bo->exec = false;
    bo->anchor = anchor;
+   bo->anchor_size = pages * 4096;
    bo->gpu_va = (uint64_t)(uintptr_t)anchor;
    pan_kmod_bo_init(&bo->base, dev, NULL, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED,
                     p_atomic_inc_return(&kbase_dev->next_handle));
    kbase_bo_history_add(kbase_bo_allocs, &kbase_bo_alloc_next, bo->gpu_va, pages * 4096,
                         PAN_KMOD_BO_FLAG_IMPORTED);
-   kbase_live_add(bo->gpu_va, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED, true,
+   kbase_live_add(bo->gpu_va, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED, true, false,
                   (uintptr_t)__builtin_return_address(0));
 
    struct pan_kmod_bo **slot = util_sparse_array_get(&dev->handle_to_bo.array, bo->base.handle);
@@ -2239,7 +2308,7 @@ pan_kmod_kbase_bo_map_repeated(struct pan_kmod_bo *bo, unsigned count, uint64_t 
       munmap(p, size);
       return 0;
    }
-   kbase_live_add((uint64_t)(uintptr_t)p, size, bo->flags | KBASE_LIVE_REPEATED, true,
+   kbase_live_add((uint64_t)(uintptr_t)p, size, bo->flags | KBASE_LIVE_REPEATED, true, false,
                   (uintptr_t)__builtin_return_address(0));
    return (uint64_t)(uintptr_t)p;
 }
@@ -3213,9 +3282,14 @@ kbase_csf_thread(void *arg)
                kbase_bo_history_explain(sideband, what, sizeof(what));
                mesa_loge("kbase: fault %s", what);
                kbase_log_persist("fault %s", what);
-               kbase_live_explain(sideband, what, sizeof(what));
+               char tail[16 * 17 + 1];
+               kbase_live_explain(sideband, what, sizeof(what), tail, sizeof(tail));
                mesa_loge("kbase: fault address now: %s", what);
                kbase_log_persist("fault address now: %s", what);
+               if (tail[0]) {
+                  mesa_loge("kbase:   its last bytes: %s", tail);
+                  kbase_log_persist("  its last bytes: %s", tail);
+               }
                const uint64_t around = 256ull << 10;
                kbase_log_maps_range(sideband > around ? sideband - around : 0,
                                     sideband + around, 16);
