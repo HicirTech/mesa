@@ -16,7 +16,7 @@
 
 /* BC formats on Bifrost texture units that lack them. An image of such a format gets a hidden
  * second plane in a format the hardware decodes, and a compute shader
- * (src/compiler/glsl/bc_decoder.glsl, shared with RADV) fills it after every copy into the image.
+ * (src/compiler/glsl/bc_decoder.glsl, this tree's own) fills it after every copy into the image.
  * Plane 0 keeps the blocks the app wrote, so copies out of the image return them unchanged.
  *
  * Two kinds of part, measured on the devices:
