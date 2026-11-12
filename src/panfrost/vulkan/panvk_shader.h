@@ -167,7 +167,8 @@ struct panvk_graphics_sysvals {
       aligned_u64 pos;
       aligned_u64 general;
       uint32_t instance_stride;
-      uint32_t pad;
+      /* How many vertices the rasterization pass can read at pos and general (0: unbounded). */
+      uint32_t rast_vertices;
    } gs_io;
 #endif
 

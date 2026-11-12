@@ -1426,6 +1426,15 @@ v9_build_gs_rast(struct panvk_device *dev, const struct v9_gs_out *outs, unsigne
    nir_def *pos_base = load_sysval(&b, graphics, 64, gs_io.pos);
    nir_def *gen_base = load_sysval(&b, graphics, 64, gs_io.general);
 
+   /* Every index the emulation writes is below the vertex count, yet this shader has read the
+    * record one past the last: Deep Rock Galactic, UE4's 64-slice translucency volume, caught by
+    * the kbase backend's guard pages (KBASE_GUARD_PAGES=detect) as a read 0 bytes past the end of
+    * out_gen. A vertex no index names produces nothing, so what it reads does not matter, but it
+    * has to stay inside the buffers: past them the GPU faults whenever they end their slab.
+    * rast_vertices is 0 on a path that does not set it, and then this clamps nothing. */
+   vid = nir_umin(&b, vid,
+                  nir_iadd_imm(&b, load_sysval(&b, graphics, 32, gs_io.rast_vertices), -1));
+
    nir_variable *pos =
       nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "gl_Position");
    pos->data.location = VARYING_SLOT_POS;

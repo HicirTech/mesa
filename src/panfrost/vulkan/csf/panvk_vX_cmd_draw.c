@@ -4028,6 +4028,7 @@ gs_draw(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_info *draw,
    /* The rasterization pass: the emulation's vertices through the rasterization variant. */
    cmdbuf->state.gfx.sysvals.gs_io.pos = out_pos.gpu;
    cmdbuf->state.gfx.sysvals.gs_io.general = out_gen.gpu;
+   cmdbuf->state.gfx.sysvals.gs_io.rast_vertices = out_verts;
    const struct panvk_draw_info rast_draw = {
       .index.buffer_dev_addr = out_idx.gpu,
       .index.buffer_size = out_indices * 4,
@@ -4531,6 +4532,8 @@ tess_draw(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_info *draw, u
    const uint32_t n_idx = gs ? out_indices : cap - cap % tess_vpp;
    cmdbuf->state.gfx.sysvals.gs_io.pos = gs ? gs_pos.gpu : tes_pos.gpu;
    cmdbuf->state.gfx.sysvals.gs_io.general = gs ? gs_gen.gpu : tes_gen.gpu;
+   /* gs_pos/gs_gen hold out_verts vertices, tes_pos/tes_gen cap, which out_verts is then. */
+   cmdbuf->state.gfx.sysvals.gs_io.rast_vertices = out_verts;
    const struct panvk_draw_info rast_draw = {
       .index.buffer_dev_addr = gs ? gs_idx.gpu : tes_idx.gpu,
       .index.buffer_size = n_idx * 4,
