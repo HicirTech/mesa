@@ -13,6 +13,7 @@ test(
       'test-optimizer.cpp',
       'test-pack-formats.cpp',
       'test-packing.cpp',
+      'test-ra-coalesce.cpp',
       'test-scheduler-predicates.cpp',
     ),
     cpp_args : [cpp_msvc_compat_args],

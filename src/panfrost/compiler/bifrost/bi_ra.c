@@ -936,7 +936,10 @@ static bool bi_is_tied(const bi_instr *I);
  *
  * Only SSA values below first_reg (not phi webs) with one single-register
  * definition and no modifiers are taken, each into one collect. Operands with
- * fixed registers (blend, coverage, tied staging) keep their moves.
+ * fixed registers (blend, coverage, tied staging) keep their moves, and so do
+ * the vectors BLEND, ATEST and ZS_EMIT read: RA precolours those, the colour of
+ * every render target to R0-R3, and does not check precoloured nodes against
+ * each other, so a colour computed in place overwrote the other targets'.
  *
  * A coalesced vector is live from its first component's definition, which can
  * cost a thread or force spilling: bi_register_allocate then starts over from a
@@ -947,12 +950,15 @@ bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
 {
    bi_instr **def = calloc(first_reg, sizeof(*def));
    BITSET_WORD *skip = BITSET_CALLOC(first_reg);
+   BITSET_WORD *precoloured = BITSET_CALLOC(first_reg);
    bi_index *rename = calloc(first_reg, sizeof(*rename));
    bool any = false;
 
    bi_foreach_instr_global(ctx, I) {
-      const bool fixed = I->op == BI_OPCODE_BLEND || I->op == BI_OPCODE_ATEST ||
-                         I->op == BI_OPCODE_ZS_EMIT || I->op == BI_OPCODE_PHI ||
+      const bool precolours = I->op == BI_OPCODE_BLEND ||
+                              I->op == BI_OPCODE_ATEST ||
+                              I->op == BI_OPCODE_ZS_EMIT;
+      const bool fixed = precolours || I->op == BI_OPCODE_PHI ||
                          I->op == BI_OPCODE_SPLIT_I32 ||
                          I->op == BI_OPCODE_COLLECT_I32 || bi_is_tied(I);
 
@@ -968,15 +974,20 @@ bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
 
       if (fixed && I->op != BI_OPCODE_COLLECT_I32) {
          bi_foreach_ssa_src(I, s) {
-            if (I->src[s].value < first_reg)
-               BITSET_SET(skip, I->src[s].value);
+            if (I->src[s].value >= first_reg)
+               continue;
+
+            BITSET_SET(skip, I->src[s].value);
+            if (precolours)
+               BITSET_SET(precoloured, I->src[s].value);
          }
       }
    }
 
    bi_foreach_instr_global(ctx, I) {
       if (I->op != BI_OPCODE_COLLECT_I32 || I->nr_srcs < 2 ||
-          I->dest[0].value >= first_reg || I->dest[0].memory)
+          I->dest[0].value >= first_reg || I->dest[0].memory ||
+          BITSET_TEST(precoloured, I->dest[0].value))
          continue;
 
       bi_foreach_src(I, i) {
@@ -1016,6 +1027,7 @@ bi_coalesce_collects(bi_context *ctx, unsigned first_reg)
    }
 
    free(rename);
+   free(precoloured);
    free(skip);
    free(def);
    return any;
