@@ -128,10 +128,92 @@ panvk_pool_stats_report(FILE *out)
 }
 
 void
+panvk_bo_pool_init_shared(struct panvk_bo_pool *bo_pool, uint64_t max_size)
+{
+   panvk_bo_pool_init(bo_pool);
+   simple_mtx_init(&bo_pool->lock, mtx_plain);
+   bo_pool->shared = true;
+   bo_pool->max_size = max_size;
+}
+
+void
 panvk_bo_pool_cleanup(struct panvk_bo_pool *bo_pool)
 {
+   if (bo_pool->shared)
+      simple_mtx_lock(&bo_pool->lock);
+
    list_for_each_entry_safe(struct panvk_priv_bo, bo, &bo_pool->free_bos,
                             node) {
+      list_del(&bo->node);
+      panvk_priv_bo_unref(bo);
+   }
+   bo_pool->size = 0;
+
+   if (bo_pool->shared)
+      simple_mtx_unlock(&bo_pool->lock);
+}
+
+/* The smallest BO of a BO pool that holds size bytes, so that a small request does not take the
+ * BO a large one will ask for. */
+static struct panvk_priv_bo *
+panvk_bo_pool_take(struct panvk_bo_pool *bo_pool, size_t size)
+{
+   struct panvk_priv_bo *best = NULL;
+
+   if (bo_pool->shared)
+      simple_mtx_lock(&bo_pool->lock);
+
+   list_for_each_entry(struct panvk_priv_bo, bo, &bo_pool->free_bos, node) {
+      const size_t bo_size = pan_kmod_bo_size(bo->bo);
+
+      if (bo_size < size || (best && bo_size >= pan_kmod_bo_size(best->bo)))
+         continue;
+
+      best = bo;
+      if (bo_size == size)
+         break;
+   }
+
+   if (best) {
+      list_del(&best->node);
+      if (bo_pool->shared)
+         bo_pool->size -= pan_kmod_bo_size(best->bo);
+   }
+
+   if (bo_pool->shared)
+      simple_mtx_unlock(&bo_pool->lock);
+
+   return best;
+}
+
+/* Gives the BOs of a pool back to a BO pool. A shared one frees those it has no room for. */
+static void
+panvk_bo_pool_give(struct panvk_bo_pool *bo_pool, struct list_head *bos)
+{
+   if (!bo_pool->shared) {
+      list_splicetail(bos, &bo_pool->free_bos);
+      list_inithead(bos);
+      return;
+   }
+
+   struct list_head excess;
+   list_inithead(&excess);
+
+   simple_mtx_lock(&bo_pool->lock);
+   list_for_each_entry_safe(struct panvk_priv_bo, bo, bos, node) {
+      const uint64_t bo_size = pan_kmod_bo_size(bo->bo);
+
+      list_del(&bo->node);
+      if (bo_pool->size + bo_size <= bo_pool->max_size) {
+         list_add(&bo->node, &bo_pool->free_bos);
+         bo_pool->size += bo_size;
+      } else {
+         list_addtail(&bo->node, &excess);
+      }
+   }
+   simple_mtx_unlock(&bo_pool->lock);
+
+   list_for_each_entry_safe(struct panvk_priv_bo, bo, &excess, node) {
       list_del(&bo->node);
       panvk_priv_bo_unref(bo);
    }
@@ -159,24 +241,13 @@ panvk_pool_alloc_backing(struct panvk_pool *pool, size_t sz)
    struct panvk_priv_bo *bo = NULL;
 
    /* If there's a free BO in our BO pool, let's pick it. */
-   if (pool->bo_pool && bo_sz == pool->base.slab_size &&
-       !list_is_empty(&pool->bo_pool->free_bos)) {
-      bo =
-         list_first_entry(&pool->bo_pool->free_bos, struct panvk_priv_bo, node);
-      list_del(&bo->node);
-   } else {
-      if (pool->big_bo_pool) {
-         list_for_each_entry_safe(struct panvk_priv_bo, pooled_bo,
-                                  &pool->big_bo_pool->free_bos, node) {
-            const size_t picked_bo_sz = pan_kmod_bo_size(pooled_bo->bo);
-            /* check if we have any sufficient match */
-            if (picked_bo_sz >= bo_sz) {
-               bo = pooled_bo;
-               list_del(&bo->node);
-               break;
-            }
-         }
-      }
+   if (pool->bo_pool && bo_sz == pool->base.slab_size)
+      bo = panvk_bo_pool_take(pool->bo_pool, bo_sz);
+
+   if (bo == NULL) {
+      /* check if we have any sufficient match */
+      if (pool->big_bo_pool)
+         bo = panvk_bo_pool_take(pool->big_bo_pool, bo_sz);
 
       if (bo == NULL) {
          /* We don't know what the BO will be used for, so let's flag it
@@ -369,8 +440,7 @@ panvk_pool_reset(struct panvk_pool *pool)
       pool_stats_reset(pool);
 
    if (pool->bo_pool) {
-      list_splicetail(&pool->bos, &pool->bo_pool->free_bos);
-      list_inithead(&pool->bos);
+      panvk_bo_pool_give(pool->bo_pool, &pool->bos);
    } else {
       list_for_each_entry_safe(struct panvk_priv_bo, bo, &pool->bos, node) {
          list_del(&bo->node);
@@ -379,8 +449,7 @@ panvk_pool_reset(struct panvk_pool *pool)
    }
 
    if (pool->big_bo_pool) {
-      list_splicetail(&pool->big_bos, &pool->big_bo_pool->free_bos);
-      list_inithead(&pool->big_bos);
+      panvk_bo_pool_give(pool->big_bo_pool, &pool->big_bos);
    } else {
       list_for_each_entry_safe(struct panvk_priv_bo, bo, &pool->big_bos, node) {
          list_del(&bo->node);

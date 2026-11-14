@@ -138,6 +138,16 @@ struct panvk_device {
       struct panvk_pool exec;
       /* Sync objects command streams wait on (PAN_KMOD_BO_FLAG_KBASE_SYNC on kbase). */
       struct panvk_pool sync;
+
+      /* v10+: the BOs command buffers give back when they are reset, for the next command buffer
+       * of the device to take, whatever its command pool. Kept per command pool, a client that
+       * records into sixteen of them in turn (DXVK) held sixteen times what a frame needs. */
+      struct {
+         struct panvk_bo_pool cs;
+         struct panvk_bo_pool desc;
+         struct panvk_bo_pool tls;
+         struct panvk_bo_pool tls_big;
+      } cmd;
    } mempools;
 
    struct {

@@ -118,6 +118,13 @@ panvk_device_init_mempools(struct panvk_device *dev)
    if (pan_kmod_kbase_is_csf(dev->kmod.dev))
       sync_pool_props.create_flags = PAN_KMOD_BO_FLAG_KBASE_SYNC;
    panvk_pool_init(&dev->mempools.sync, dev, NULL, NULL, &sync_pool_props);
+
+   /* What command buffers leave behind is kept up to a few frames' worth; a burst past that,
+    * as when a game loads its textures, goes back to the kernel. */
+   panvk_bo_pool_init_shared(&dev->mempools.cmd.cs, 16 << 20);
+   panvk_bo_pool_init_shared(&dev->mempools.cmd.desc, 32 << 20);
+   panvk_bo_pool_init_shared(&dev->mempools.cmd.tls, 4 << 20);
+   panvk_bo_pool_init_shared(&dev->mempools.cmd.tls_big, 64 << 20);
 }
 
 static void
@@ -127,6 +134,17 @@ panvk_device_cleanup_mempools(struct panvk_device *dev)
    panvk_pool_cleanup(&dev->mempools.rw_nc);
    panvk_pool_cleanup(&dev->mempools.sync);
    panvk_pool_cleanup(&dev->mempools.exec);
+
+   struct panvk_bo_pool *cmd_bo_pools[] = {
+      &dev->mempools.cmd.cs,
+      &dev->mempools.cmd.desc,
+      &dev->mempools.cmd.tls,
+      &dev->mempools.cmd.tls_big,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cmd_bo_pools); i++) {
+      panvk_bo_pool_cleanup(cmd_bo_pools[i]);
+      simple_mtx_destroy(&cmd_bo_pools[i]->lock);
+   }
 }
 
 /* On JM, this is called during device initialization. On CSF, panthor doesn't

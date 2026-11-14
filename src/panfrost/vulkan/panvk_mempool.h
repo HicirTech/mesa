@@ -7,6 +7,7 @@
 #define __PANVK_POOL_H__
 
 #include <stdio.h>
+#include <string.h>
 
 #include "panvk_priv_bo.h"
 
@@ -18,13 +19,24 @@
 
 struct panvk_bo_pool {
    struct list_head free_bos;
+
+   /* Set for a BO pool that the command buffers of several command pools use (the device's, on
+    * CSF): its list is then only touched with lock held, and it keeps at most max_size bytes of
+    * BOs, of which it holds size; a BO that comes back past that is freed. A command pool's own
+    * BO pool needs no lock and has no limit. */
+   bool shared;
+   simple_mtx_t lock;
+   uint64_t size, max_size;
 };
 
 static inline void
 panvk_bo_pool_init(struct panvk_bo_pool *bo_pool)
 {
+   memset(bo_pool, 0, sizeof(*bo_pool));
    list_inithead(&bo_pool->free_bos);
 }
+
+void panvk_bo_pool_init_shared(struct panvk_bo_pool *bo_pool, uint64_t max_size);
 
 void panvk_bo_pool_cleanup(struct panvk_bo_pool *bo_pool);
 
