@@ -95,6 +95,17 @@ VkResult panvk_per_arch(cmd_prepare_shader_desc_tables)(
    bool fill_image_table,
    struct panvk_shader_desc_state *shader_desc_state);
 #else
+/* A dynamic buffer as bound now: address with the dynamic offset applied, and the size its
+ * descriptor declares. */
+struct panvk_dyn_buf_range {
+   uint64_t address;
+   uint32_t size;
+};
+
+struct panvk_dyn_buf_range panvk_per_arch(cmd_get_dyn_buf)(
+   const struct panvk_descriptor_state *desc_state,
+   const struct panvk_shader_desc_info *desc_info, uint32_t i);
+
 void panvk_per_arch(cmd_fill_dyn_bufs)(
    const struct panvk_descriptor_state *desc_state,
    const struct panvk_shader_desc_info *desc_info,

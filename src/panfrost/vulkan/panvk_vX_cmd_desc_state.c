@@ -232,6 +232,29 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
    return VK_SUCCESS;
 }
 #else
+struct panvk_dyn_buf_range
+panvk_per_arch(cmd_get_dyn_buf)(
+   const struct panvk_descriptor_state *desc_state,
+   const struct panvk_shader_desc_info *desc_info, uint32_t i)
+{
+   uint32_t src_handle = desc_info->dyn_bufs.map[i];
+   uint32_t set_idx = COPY_DESC_HANDLE_EXTRACT_TABLE(src_handle);
+   uint32_t dyn_buf_idx = COPY_DESC_HANDLE_EXTRACT_INDEX(src_handle);
+   const struct panvk_descriptor_set *set = desc_state->sets[set_idx];
+   const uint32_t dyn_buf_offset =
+      desc_state->dyn_buf_offsets[set_idx][dyn_buf_idx];
+   const bool is_ssbo =
+      desc_state->dyn_ssbos[set_idx] & BITFIELD_BIT(dyn_buf_idx);
+
+   assert(set_idx < MAX_SETS);
+   assert(set);
+
+   return (struct panvk_dyn_buf_range){
+      .address = set->dyn_bufs[dyn_buf_idx].dev_addr + dyn_buf_offset,
+      .size = align(set->dyn_bufs[dyn_buf_idx].size, is_ssbo ? 4 : 16),
+   };
+}
+
 void
 panvk_per_arch(cmd_fill_dyn_bufs)(
    const struct panvk_descriptor_state *desc_state,
@@ -239,21 +262,12 @@ panvk_per_arch(cmd_fill_dyn_bufs)(
    struct mali_buffer_packed *buffers)
 {
    for (uint32_t i = 0; i < desc_info->dyn_bufs.count; i++) {
-      uint32_t src_handle = desc_info->dyn_bufs.map[i];
-      uint32_t set_idx = COPY_DESC_HANDLE_EXTRACT_TABLE(src_handle);
-      uint32_t dyn_buf_idx = COPY_DESC_HANDLE_EXTRACT_INDEX(src_handle);
-      const struct panvk_descriptor_set *set = desc_state->sets[set_idx];
-      const uint32_t dyn_buf_offset =
-         desc_state->dyn_buf_offsets[set_idx][dyn_buf_idx];
-      const bool is_ssbo =
-         desc_state->dyn_ssbos[set_idx] & BITFIELD_BIT(dyn_buf_idx);
-
-      assert(set_idx < MAX_SETS);
-      assert(set);
+      const struct panvk_dyn_buf_range range =
+         panvk_per_arch(cmd_get_dyn_buf)(desc_state, desc_info, i);
 
       pan_pack(&buffers[i], BUFFER, cfg) {
-         cfg.size = align(set->dyn_bufs[dyn_buf_idx].size, is_ssbo ? 4 : 16);
-         cfg.address = set->dyn_bufs[dyn_buf_idx].dev_addr + dyn_buf_offset;
+         cfg.size = range.size;
+         cfg.address = range.address;
       }
    }
 }
