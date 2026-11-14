@@ -17,6 +17,7 @@
 
 #if DETECT_OS_ANDROID
 #include <dlfcn.h>
+#include <errno.h>
 #include <unistd.h>
 #endif
 
@@ -155,14 +156,26 @@ get_drm_device_ids(struct panvk_physical_device *device,
 #if defined(ENABLE_SHADER_CACHE) && DETECT_OS_ANDROID
 /* Upstream keeps the disk shader cache off on Android, and apps have no HOME, so every launch
  * recompiled every pipeline (the app's and our BC decoders). Give the cache an app-private
- * directory: $TMPDIR, else the directory this .so was loaded from. Only /data/ paths, never FUSE
- * external storage, since cache reads run on the compiling thread. MESA_SHADER_CACHE_DISABLE and
- * MESA_SHADER_CACHE_DIR still win. Same scheme as RADV on Xclipse. */
+ * directory: $HOME/.cache where there is a HOME (Wine launchers set one per container, and
+ * GameNative empties $TMPDIR at every start), else $TMPDIR, else the directory this .so was
+ * loaded from. Only /data/ paths, never FUSE external storage, since cache reads run on the
+ * compiling thread. MESA_SHADER_CACHE_DISABLE and MESA_SHADER_CACHE_DIR still win. Same scheme
+ * as RADV on Xclipse. */
 static void
 panvk_android_disk_cache_dir(void)
 {
    char dir[512] = {0};
+   const char *home = getenv("HOME");
    const char *t = getenv("TMPDIR");
+
+   if (home && !strncmp(home, "/data/", 6) && access(home, W_OK) == 0) {
+      snprintf(dir, sizeof(dir), "%s/.cache", home);
+      if (mkdir(dir, 0700) == 0 || errno == EEXIST) {
+         disk_cache_set_default_dir(dir);
+         return;
+      }
+      dir[0] = '\0';
+   }
 
    if (t && !strncmp(t, "/data/", 6) && access(t, W_OK) == 0) {
       snprintf(dir, sizeof(dir), "%s", t);
