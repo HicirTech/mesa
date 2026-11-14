@@ -782,6 +782,28 @@ pan_mod_interleaved_64k_test_props(const struct pan_kmod_dev_props *dprops,
        iprops->extent_px.height < tile_extent_px.height / 2)
       return PAN_MOD_NOT_OPTIMAL;
 
+   /* Every mip level takes whole tiles, the ones smaller than a tile too: a full chain ends in
+    * seven or eight levels of 64 KiB each, more than all the levels of a 512x512 RGBA8 image
+    * hold. Not worth it when that adds more than an eighth to the image (in Deep Rock Galactic
+    * it took 1.8 GiB for 1.0 GiB of textures). */
+   const unsigned block_size_B = util_format_get_blocksize(iprops->format);
+   uint64_t tiles = 0, size_B = 0;
+
+   for (unsigned l = 0; l < iprops->nr_slices; l++) {
+      const unsigned width = u_minify(iprops->extent_px.width, l);
+      const unsigned height = u_minify(iprops->extent_px.height, l);
+      const unsigned depth = u_minify(iprops->extent_px.depth, l);
+
+      tiles += (uint64_t)DIV_ROUND_UP(width, tile_extent_px.width) *
+               DIV_ROUND_UP(height, tile_extent_px.height) * depth;
+      size_B += (uint64_t)util_format_get_nblocksx(iprops->format, width) *
+                util_format_get_nblocksy(iprops->format, height) * depth *
+                block_size_B;
+   }
+
+   if (tiles * 65536 > size_B + size_B / 8)
+      return PAN_MOD_NOT_OPTIMAL;
+
    return PAN_MOD_OPTIMAL;
 }
 
