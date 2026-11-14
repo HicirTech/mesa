@@ -2477,6 +2477,15 @@ struct kbase_ioctl_cs_tiler_heap_term {
 #define KBASE_CSF_RING_SIZE (64 * 1024)
 #define KBASE_CSF_MAX_SUBS  256
 
+/* Deferred vertex shading (RUN_IDVS2, Vertex Shading Mode = Deferred) keeps each shader core's
+ * vertex positions in a per-group work buffer between the binning and the main phase. kbase hands
+ * it to the firmware only when dvs_buf is non-zero (program_csg_slot); with zero, the CSG slot
+ * keeps the buffer of whichever group ran there before, usually another process's, and deferred
+ * draws fault there. Layout as the Arm driver sets it up on G720 MC12: one slot of this many pages
+ * per core index up to the highest present core, one page more, and the slot size in pages in
+ * the low 12 bits of dvs_buf (CSG_DVS_BUF_BUFFER_SIZE). */
+#define KBASE_CSF_DVS_PAGES_PER_CORE 6
+
 struct kbase_csf_ring {
    uint64_t va;
    uint64_t *cpu;
@@ -2504,6 +2513,9 @@ struct pan_kmod_kbase_csf_group {
    /* One u64 seqno per queue, 64 bytes apart, in CSF_EVENT memory. */
    uint64_t seq_va;
    volatile uint64_t *seqno;
+   /* The deferred vertex shading work buffer (KBASE_CSF_DVS_PAGES_PER_CORE). */
+   void *dvs;
+   uint64_t dvs_va, dvs_size;
    /* Submissions in flight, oldest first. */
    struct kbase_csf_sub subs[KBASE_CSF_MAX_SUBS];
    unsigned first_sub, nr_subs;
@@ -3392,6 +3404,12 @@ pan_kmod_kbase_csf_group_create(struct pan_kmod_dev *dev, unsigned nr_queues,
    for (unsigned q = 0; q < nr_queues; q++)
       g->seqno[q * 8] = 0;
 
+   g->dvs_size =
+      (util_last_bit64(dev->props.shader_present) * KBASE_CSF_DVS_PAGES_PER_CORE + 1) * 4096ull;
+   g->dvs = kbase_csf_alloc(kdev, g->dvs_size, 0xfull | BASE_MEM_SAME_VA, &g->dvs_va);
+   if (!g->dvs)
+      goto err_free_seq;
+
    union kbase_ioctl_cs_queue_group_create gc = {
       .in = {
          .tiler_mask = 1,
@@ -3402,11 +3420,12 @@ pan_kmod_kbase_csf_group_create(struct pan_kmod_dev *dev, unsigned nr_queues,
          .tiler_max = 1,
          .fragment_max = max_fragment,
          .compute_max = max_compute,
+         .dvs_buf = g->dvs_va | KBASE_CSF_DVS_PAGES_PER_CORE,
       },
    };
    if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &gc)) {
       mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d)", errno);
-      goto err_free_seq;
+      goto err_free_dvs;
    }
    g->handle = gc.out.group_handle;
 
@@ -3490,6 +3509,8 @@ err_term:
          munmap(r->cpu, KBASE_CSF_RING_SIZE);
       }
    }
+err_free_dvs:
+   munmap(g->dvs, g->dvs_size);
 err_free_seq:
    munmap((void *)g->seqno, 4096);
 err_free:
@@ -3540,6 +3561,7 @@ pan_kmod_kbase_csf_group_destroy(struct pan_kmod_kbase_csf_group *g)
       pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &a);
       munmap(r->cpu, KBASE_CSF_RING_SIZE);
    }
+   munmap(g->dvs, g->dvs_size);
    munmap((void *)g->seqno, 4096);
    free(g);
 }
