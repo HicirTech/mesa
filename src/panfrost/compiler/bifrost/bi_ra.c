@@ -1495,6 +1495,9 @@ bi_register_allocate(bi_context *ctx)
    if (ctx->arch >= 9)
       va_lower_split_64bit(ctx);
 
+   /* What the shader needs at its fullest point, exact in SSA form; 0 when not computed. */
+   unsigned register_demand = 0;
+
    /* get estimate of register demand (must be done in SSA form)
     * and do a preliminary spill; this doesn't have to be perfect,
     * since register allocation can spill too, but RA is really slow
@@ -1509,7 +1512,7 @@ bi_register_allocate(bi_context *ctx)
       if (verbose) {
          bi_print_shader(ctx, stderr);
       }
-      unsigned register_demand = bi_calc_register_demand(ctx);
+      register_demand = bi_calc_register_demand(ctx);
       if (register_demand > regs_to_use) {
          /* spill registers if we can */
          if (ctx->inputs->is_blend)
@@ -1529,6 +1532,9 @@ bi_register_allocate(bi_context *ctx)
             fprintf(stderr, "\nspill_registers=%d\n", spill_count);
             bi_print_shader(ctx, stderr);
          }
+
+         /* The spiller stops as soon as the shader fits. */
+         register_demand = regs_to_use;
       }
    }
 
@@ -1545,8 +1551,13 @@ bi_register_allocate(bi_context *ctx)
     * collects are only worth it if they keep the thread count and do not
     * spill: fall back to the plain moves first at 32 registers, then at the
     * full register file.
+    *
+    * A shader with more than 32 registers live at one point cannot fit in 32,
+    * and each attempt on it costs as much as the one that succeeds below. In
+    * Deep Rock Galactic that is a quarter of the shaders (123 of 498) holding
+    * three quarters of the code.
     */
-   if (ctx->arch >= 7) {
+   if (ctx->arch >= 7 && register_demand <= 32) {
       l = bi_allocate_registers(ctx, &success, false);
 
       if (!success && coalesce) {
