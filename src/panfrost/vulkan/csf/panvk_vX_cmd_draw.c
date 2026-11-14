@@ -1841,22 +1841,27 @@ get_fb_descs(struct panvk_cmd_buffer *cmdbuf)
 
       ir_store = &ir_store_without_crc;
 #endif
+      fbd_info.load = ir_pass == PANVK_IR_FIRST_PASS ? &render->fb.load
+                                                     : &render->fb.spill.load;
+      fbd_info.store = ir_store;
+
+      /* One set of frame shaders for all the layers, as above: they do not depend on the layer,
+       * and each set comes with texture descriptors that list every layer of every attachment
+       * it loads. Emitted per layer, a 64-layer volume took 64 times 64 of those three times
+       * over, and such passes were most of the 28 MiB of descriptors a Deep Rock Galactic
+       * frame needed. */
+      result = panvk_per_arch(cmd_get_frame_shaders)(
+         cmdbuf, fbd_info.fb, fbd_info.load,
+         ir_pass == PANVK_IR_LAST_PASS ? &render->fb.resolve : NULL,
+         &fbd_info.frame_shaders);
+      if (result != VK_SUCCESS)
+         return result;
+
       for (uint32_t i = 0; i < enabled_layer_count; i++) {
          uint32_t layer_idx = multiview ? u_bit_scan(&ir_view_mask_temp) : i;
 
          fbd_info.layer = layer_idx;
          tiler_ctx = get_tiler_context(cmdbuf, layer_idx);
-         fbd_info.load = ir_pass == PANVK_IR_FIRST_PASS
-                            ? &render->fb.load
-                            : &render->fb.spill.load;
-         fbd_info.store = ir_store;
-
-         VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
-            cmdbuf, fbd_info.fb, fbd_info.load,
-            ir_pass == PANVK_IR_LAST_PASS ? &render->fb.resolve : NULL,
-            &fbd_info.frame_shaders);
-         if (result != VK_SUCCESS)
-            return result;
 
          const struct pan_ptr fbd = pan_ptr_offset(ir_fbds, fbd_sz * i);
          const struct pan_fb_descs fb_descs = {
