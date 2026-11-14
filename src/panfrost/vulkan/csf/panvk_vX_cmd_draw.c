@@ -4289,8 +4289,27 @@ tess_draw(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_info *draw, u
    const struct panvk_shader *tes_shader = cmdbuf->state.gfx.tess.tes;
    const struct panvk_shader *gs_shader = cmdbuf->state.gfx.gs.app_shader;
 
-   if (!tcs_shader || !tes_shader || !dev->tess_heap)
+   if (!tcs_shader || !tes_shader)
       return;
+
+   /* The heap is committed whole (64 MiB), so only once a draw needs it. */
+   if (unlikely(!p_atomic_read(&dev->tess_heap))) {
+      struct panvk_priv_bo *tess_heap = NULL;
+
+      simple_mtx_lock(&dev->poly_heap.init_lock);
+      if (!dev->tess_heap &&
+          panvk_priv_bo_create(dev, PANVK_TESS_HEAP_SIZE, PAN_KMOD_BO_FLAG_NO_MMAP,
+                               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "Tess Heap",
+                               &tess_heap) == VK_SUCCESS)
+         p_atomic_set(&dev->tess_heap, tess_heap);
+      tess_heap = dev->tess_heap;
+      simple_mtx_unlock(&dev->poly_heap.init_lock);
+
+      if (!tess_heap) {
+         vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+   }
 
    const struct panvk_shader_variant *vs = panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
    const struct panvk_shader_variant *tcs = panvk_shader_only_variant(tcs_shader);

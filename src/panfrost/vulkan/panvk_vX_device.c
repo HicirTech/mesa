@@ -757,10 +757,12 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "Tess Heap", &device->tess_heap);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
-#else
-   /* Committed up front: panthor has no grow-on-fault memory, and the tessellator's allocations
-    * stay inside it (panlib_tess_prefix_sum). Only for devices that can tessellate. v9 commits
-    * it too, as the tessellation path it shares with CSF was tested that way. */
+#elif PAN_ARCH == 9
+   /* Committed whole: panthor has no grow-on-fault memory, and the tessellator's allocations stay
+    * inside it (panlib_tess_prefix_sum). Only for devices that can tessellate. v9 commits it up
+    * front, as the tessellation path it shares with CSF was tested that way; CSF commits it at the
+    * first tessellated draw (tess_draw), since DXVK enables the feature for every game and few
+    * of them tessellate. */
    if (device->vk.enabled_features.tessellationShader) {
       result = panvk_priv_bo_create(device, PANVK_TESS_HEAP_SIZE, PAN_KMOD_BO_FLAG_NO_MMAP,
                                     VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "Tess Heap",

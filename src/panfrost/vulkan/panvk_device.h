@@ -75,8 +75,9 @@ struct panvk_device {
    struct panvk_priv_bo *tiler_heap[2];
    unsigned tiler_heap_next;
    struct panvk_priv_bo *sample_positions;
-   /* v6/v7 tessellation: the domain points and index buffers the tessellator writes, reused by
-    * every batch (see panlib_tess_prefix_sum). */
+   /* Tessellation: the domain points and index buffers the tessellator writes, reused by every
+    * batch (see panlib_tess_prefix_sum). On v10+ it is made by the first tessellated draw, under
+    * poly_heap.init_lock. */
    struct panvk_priv_bo *tess_heap;
 
    /* v10+: the thread stacks every command buffer shares. The GPU finds a thread's stack from its
