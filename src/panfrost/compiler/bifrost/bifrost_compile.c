@@ -4064,34 +4064,48 @@ va_gather_stats_block(bi_block *block, struct va_stats *counts, unsigned arch)
    return nr_ins;
 }
 
+/* The shortest path from a block to the end of the shader: its instruction count and stats. */
+struct va_min_path {
+   bool done;
+   unsigned nr_ins;
+   struct va_stats counts;
+};
+
 /*
  * Gather stats for a minimum length path through the shader.
+ *
+ * The path taken from a block does not depend on how the block was reached, so each block is
+ * resolved once; walking every path instead takes 2^n steps for n successive branches.
  */
 static unsigned
-va_gather_min_path_stats(bi_block *block, struct va_stats *counts, unsigned arch)
+va_gather_min_path_stats(bi_block *block, struct va_min_path *memo, unsigned arch)
 {
-   struct va_stats min_counts;
-   struct va_stats save_counts = *counts;
+   struct va_min_path *path = &memo[block->index];
+   if (path->done)
+      return path->nr_ins;
+
+   const struct va_min_path *min_next = NULL;
    unsigned min_ins = 0;
-   unsigned nr_ins;
 
    bi_foreach_successor(block, next) {
       // if following a path leads to a loop, do not do it
       if (bi_block_dominates(next, block)) {
          continue;
       }
-      nr_ins = va_gather_min_path_stats(next, counts, arch);
+      unsigned nr_ins = va_gather_min_path_stats(next, memo, arch);
       if (min_ins == 0 || nr_ins < min_ins) {
          min_ins = nr_ins;
-         min_counts = *counts;
+         min_next = &memo[next->index];
       }
-      *counts = save_counts;
    }
+
+   path->counts = (struct va_stats){0};
    if (min_ins != 0) {
-      *counts = min_counts;
+      path->counts = min_next->counts;
    }
-   nr_ins = min_ins + va_gather_stats_block(block, counts, arch);
-   return nr_ins;
+   path->nr_ins = min_ins + va_gather_stats_block(block, &path->counts, arch);
+   path->done = true;
+   return path->nr_ins;
 }
 
 /*
@@ -4155,9 +4169,14 @@ va_gather_stats(bi_context *ctx, unsigned size, struct valhall_stats *out,
          va_count_instr_stats(I, &counts, ctx->arch);
       }
       break;
-   case GATHER_STATS_MIN:
-      nr_ins = va_gather_min_path_stats(first_block, &counts, ctx->arch);
+   case GATHER_STATS_MIN: {
+      struct va_min_path *memo =
+         rzalloc_array(NULL, struct va_min_path, ctx->num_blocks);
+      nr_ins = va_gather_min_path_stats(first_block, memo, ctx->arch);
+      counts = memo[first_block->index].counts;
+      ralloc_free(memo);
       break;
+   }
    case GATHER_STATS_MAX:
       visited = BITSET_RZALLOC(NULL, ctx->num_blocks);
       nr_ins = va_gather_max_path_stats(first_block, &counts, visited, ctx->arch);
