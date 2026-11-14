@@ -6,6 +6,8 @@
 #ifndef __PANVK_POOL_H__
 #define __PANVK_POOL_H__
 
+#include <stdio.h>
+
 #include "panvk_priv_bo.h"
 
 #include "kmod/pan_kmod.h"
@@ -109,6 +111,8 @@ void panvk_pool_get_bo_handles(struct panvk_pool *pool, uint32_t *handles);
 
 void panvk_pool_flush_maps(struct panvk_pool *pool);
 void panvk_pool_invalidate_maps(struct panvk_pool *pool);
+
+void panvk_pool_stats_report(FILE *out);
 
 enum panvk_priv_mem_flags {
    PANVK_PRIV_MEM_OWNED_BY_POOL = BITFIELD_BIT(0),

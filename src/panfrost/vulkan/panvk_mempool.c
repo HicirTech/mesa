@@ -5,6 +5,7 @@
  */
 
 #include <dlfcn.h>
+#include <inttypes.h>
 
 #include "panvk_device.h"
 #include "panvk_mempool.h"
@@ -25,6 +26,105 @@ panvk_pool_efence(void)
    if (on < 0)
       on = debug_get_bool_option("PANVK_POOL_EFENCE", false);
    return on;
+}
+
+/* PANVK_POOL_STATS=1, for debugging: what the pools that own their BOs hand out, by the code that
+ * asked for it, and how many BOs such a pool held each time it was reset, which is what a command
+ * buffer took. panvk_pool_stats_report() prints both. */
+static bool
+panvk_pool_stats(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = debug_get_bool_option("PANVK_POOL_STATS", false);
+   return on;
+}
+
+static struct {
+   simple_mtx_t lock;
+   struct {
+      const void *pc;
+      const char *label;
+      uint64_t bytes, count;
+   } sites[256];
+   struct {
+      const char *label;
+      uint64_t resets, bos, most_bos;
+   } pools[8];
+} pool_stats = {.lock = SIMPLE_MTX_INITIALIZER};
+
+static void
+pool_stats_alloc(const struct panvk_pool *pool, const void *pc, size_t size)
+{
+   simple_mtx_lock(&pool_stats.lock);
+
+   /* Sites past the table's size share its last entry. */
+   unsigned i = 0;
+   while (i < ARRAY_SIZE(pool_stats.sites) - 1 && pool_stats.sites[i].pc &&
+          pool_stats.sites[i].pc != pc)
+      i++;
+
+   pool_stats.sites[i].pc = pc;
+   pool_stats.sites[i].label = pool->props.label;
+   pool_stats.sites[i].bytes += size;
+   pool_stats.sites[i].count++;
+
+   simple_mtx_unlock(&pool_stats.lock);
+}
+
+static void
+pool_stats_reset(const struct panvk_pool *pool)
+{
+   simple_mtx_lock(&pool_stats.lock);
+
+   unsigned i = 0;
+   while (i < ARRAY_SIZE(pool_stats.pools) - 1 && pool_stats.pools[i].label &&
+          pool_stats.pools[i].label != pool->props.label)
+      i++;
+
+   pool_stats.pools[i].label = pool->props.label;
+   pool_stats.pools[i].resets++;
+   pool_stats.pools[i].bos += pool->bo_count;
+   pool_stats.pools[i].most_bos =
+      MAX2(pool_stats.pools[i].most_bos, pool->bo_count);
+
+   simple_mtx_unlock(&pool_stats.lock);
+}
+
+void
+panvk_pool_stats_report(FILE *out)
+{
+   if (!panvk_pool_stats())
+      return;
+
+   simple_mtx_lock(&pool_stats.lock);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(pool_stats.pools); i++) {
+      if (!pool_stats.pools[i].resets)
+         continue;
+      fprintf(out,
+              "  %s: %" PRIu64 " resets holding %" PRIu64 " BOs, %" PRIu64
+              " at most\n",
+              pool_stats.pools[i].label ? pool_stats.pools[i].label : "?",
+              pool_stats.pools[i].resets, pool_stats.pools[i].bos,
+              pool_stats.pools[i].most_bos);
+   }
+
+   for (unsigned i = 0; i < ARRAY_SIZE(pool_stats.sites); i++) {
+      const void *pc = pool_stats.sites[i].pc;
+      Dl_info dl;
+
+      if (pool_stats.sites[i].bytes < (1 << 20))
+         continue;
+      fprintf(out, "  +0x%zx: %" PRIu64 " KiB in %" PRIu64 " allocations (%s)\n",
+              dladdr(pc, &dl) && dl.dli_fbase
+                 ? (size_t)((const char *)pc - (const char *)dl.dli_fbase)
+                 : (size_t)(uintptr_t)pc,
+              pool_stats.sites[i].bytes >> 10, pool_stats.sites[i].count,
+              pool_stats.sites[i].label ? pool_stats.sites[i].label : "?");
+   }
+
+   simple_mtx_unlock(&pool_stats.lock);
 }
 
 void
@@ -217,12 +317,16 @@ panvk_pool_alloc_mem(struct panvk_pool *pool, struct panvk_pool_alloc_info info)
    return ret;
 }
 
-static struct pan_ptr
+static ALWAYS_INLINE struct pan_ptr
 panvk_pool_alloc_aligned(struct panvk_pool *pool, size_t sz, unsigned alignment)
 {
    /* We just return the host/dev address, so callers can't
     * release the BO ref they acquired. */
    assert(pool->props.owns_bos);
+
+   /* Inlined into pan_pool_alloc_aligned(), so this is the address of the code that allocates. */
+   if (unlikely(panvk_pool_stats()))
+      pool_stats_alloc(pool, __builtin_return_address(0), sz);
 
    struct panvk_pool_alloc_info info = {
       .size = sz,
@@ -261,6 +365,9 @@ panvk_pool_init(struct panvk_pool *pool, struct panvk_device *dev,
 void
 panvk_pool_reset(struct panvk_pool *pool)
 {
+   if (unlikely(panvk_pool_stats()) && pool->props.owns_bos && pool->bo_count)
+      pool_stats_reset(pool);
+
    if (pool->bo_pool) {
       list_splicetail(&pool->bos, &pool->bo_pool->free_bos);
       list_inithead(&pool->bos);
