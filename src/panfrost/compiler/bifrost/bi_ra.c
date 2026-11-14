@@ -319,12 +319,36 @@ bi_make_affinity(uint64_t clobber, unsigned count, bool split_file)
    return ~clobbered;
 }
 
+/* Keeps live_nodes, the set of nodes with a live register, in step with live
+ * after bi_liveness_ins_update_ra().
+ */
+static void
+bi_live_nodes_update(BITSET_WORD *live_nodes, const uint8_t *live, bi_instr *ins)
+{
+   bi_foreach_dest(ins, d) {
+      if (!live[ins->dest[d].value])
+         BITSET_CLEAR(live_nodes, ins->dest[d].value);
+   }
+
+   bi_foreach_ssa_src(ins, src) {
+      if (live[ins->src[src].value])
+         BITSET_SET(live_nodes, ins->src[src].value);
+   }
+}
+
+/* live_nodes holds the nodes whose entry in live is not zero. Few nodes are
+ * live at a time, and visiting every node for every instruction made register
+ * allocation quadratic in the size of the shader.
+ */
 static void
 bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
-                     uint64_t preload_live, unsigned node_count, bool is_blend,
-                     bool split_file, unsigned arch)
+                     BITSET_WORD *live_nodes, uint64_t preload_live,
+                     unsigned node_count, bool is_blend, bool split_file,
+                     unsigned arch)
 {
    bool aligned_sr = arch >= 9;
+   unsigned i;
+
    bi_foreach_instr_in_block_rev(block, ins) {
       /* Mark all registers live after the instruction as
        * interfering with the destination */
@@ -348,7 +372,7 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
 
          l->affinity[node] &= affinity;
 
-         for (unsigned i = 0; i < node_count; ++i) {
+         BITSET_FOREACH_SET(i, live_nodes, node_count) {
             uint8_t r = live[i];
 
             /* Nodes only interfere if they occupy
@@ -410,15 +434,14 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
             BITFIELD64_MASK(16) |
             BITFIELD64_BIT(bi_preload_reg(BI_PRELOAD_BLEND_LINK, arch));
 
-         for (unsigned i = 0; i < node_count; ++i) {
-            if (live[i])
-               l->affinity[i] &= ~clobber;
-         }
+         BITSET_FOREACH_SET(i, live_nodes, node_count)
+            l->affinity[i] &= ~clobber;
       }
 
       /* Update live_in */
       preload_live = bi_postra_liveness_ins(preload_live, ins);
       bi_liveness_ins_update_ra(live, ins);
+      bi_live_nodes_update(live_nodes, live, ins);
    }
 
    block->reg_live_in = preload_live;
@@ -430,14 +453,25 @@ bi_compute_interference(bi_context *ctx, struct lcra_state *l, bool full_regs)
    bi_compute_liveness_ra(ctx);
    bi_postra_liveness(ctx);
 
+   BITSET_WORD *live_nodes = BITSET_CALLOC(ctx->ssa_alloc);
+
    bi_foreach_block_rev(ctx, blk) {
       uint8_t *live = mem_dup(blk->live_out, ctx->ssa_alloc);
 
-      bi_mark_interference(blk, l, live, blk->reg_live_out, ctx->ssa_alloc,
-                           ctx->inputs->is_blend, !full_regs, ctx->arch);
+      memset(live_nodes, 0, BITSET_BYTES(ctx->ssa_alloc));
+      for (unsigned i = 0; i < ctx->ssa_alloc; ++i) {
+         if (live[i])
+            BITSET_SET(live_nodes, i);
+      }
+
+      bi_mark_interference(blk, l, live, live_nodes, blk->reg_live_out,
+                           ctx->ssa_alloc, ctx->inputs->is_blend, !full_regs,
+                           ctx->arch);
 
       free(live);
    }
+
+   free(live_nodes);
 }
 
 static struct lcra_state *
