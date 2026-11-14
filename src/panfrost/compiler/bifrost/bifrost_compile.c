@@ -7,6 +7,8 @@
 
 #include "compiler/nir/nir_builder.h"
 #include "panfrost/compiler/pan_compiler.h"
+#include "util/os_misc.h"
+#include "util/u_call_once.h"
 #include "util/u_hexdump.h"
 #include "util/u_qsort.h"
 
@@ -3856,6 +3858,20 @@ bi_count_preload_cost(bi_context *ctx)
    return cost;
 }
 
+/* BIFROST_MESA_STATS_FILE=<path>: the shaderdb and statsfull statistics are appended to that
+ * file instead of stderr, each prefixed with the shader's source hash (the name its
+ * BIFROST_MESA_DUMP_DIR binary carries); for processes whose stderr nobody reads, such as a game
+ * under Wine on Android. */
+static FILE *bi_stats_file;
+
+static void
+bi_open_stats_file(void)
+{
+   const char *path = os_get_option("BIFROST_MESA_STATS_FILE");
+   if (path)
+      bi_stats_file = fopen(path, "a");
+}
+
 static const char *
 bi_shader_stage_name(bi_context *ctx)
 {
@@ -4541,12 +4557,28 @@ bi_compile_variant_nir(nir_shader *nir,
 
    if ((bifrost_debug & (BIFROST_DBG_SHADERDB|BIFROST_DBG_STATSFULL))
        && !skip_internal) {
+      static util_once_flag stats_file_once = UTIL_ONCE_FLAG_INIT;
+      util_call_once(&stats_file_once, bi_open_stats_file);
+
+      FILE *out = bi_stats_file ? bi_stats_file : stderr;
       const char *prefix = bi_shader_stage_name(ctx);
-      if (bifrost_debug & BIFROST_DBG_STATSFULL) {
-         pan_stats_verbose(stderr, prefix, ctx, stats, pinfo);
-      } else {
-         pan_stats_fprintf(stderr, prefix, stats);
+      char hashed_prefix[64 + BLAKE3_HEX_LEN];
+      if (bi_stats_file) {
+         char hash[BLAKE3_HEX_LEN];
+         _mesa_blake3_format(hash, ctx->nir->info.source_blake3);
+         snprintf(hashed_prefix, sizeof(hashed_prefix), "%s %s", prefix, hash);
+         prefix = hashed_prefix;
       }
+
+      /* Shaders compile on several threads; keep each shader's lines together. */
+      flockfile(out);
+      if (bifrost_debug & BIFROST_DBG_STATSFULL) {
+         pan_stats_verbose(out, prefix, ctx, stats, pinfo);
+      } else {
+         pan_stats_fprintf(out, prefix, stats);
+      }
+      fflush(out);
+      funlockfile(out);
    }
 
    return ctx;
