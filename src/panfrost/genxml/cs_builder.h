@@ -1576,6 +1576,9 @@ cs_run_idvs2(struct cs_builder *b, uint32_t flags_override, bool malloc_enable,
       I.flags_override = flags_override;
       I.malloc_enable = malloc_enable;
       I.vertex_shading_mode = vertex_shading_mode;
+      /* The Arm driver's deferred draws name their pipeline stage (under evaluation). */
+      if (vertex_shading_mode == MALI_IDVS_SHADING_MODE_DEFERRED)
+         I.stage = MALI_IDVS_PIPELINE_STAGE_VERTEX;
 
       if (draw_id.type == CS_INDEX_UNDEF) {
          I.draw_id_register_enable = false;

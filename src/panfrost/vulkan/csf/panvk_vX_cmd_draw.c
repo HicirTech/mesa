@@ -3102,6 +3102,23 @@ launch_gfx_cs(struct panvk_cmd_buffer *cmdbuf,
    compute_state_set_dirty(cmdbuf, PUSH_UNIFORMS);
 }
 
+#if PAN_ARCH >= 12
+/* Early shading runs the whole vertex shader while binning and passes the
+ * varyings through memory; deferred shading runs only the position part
+ * then, and the varying part in the fragment pass, for visible primitives.
+ * PANVK_DEBUG=dvs selects deferred, while it is evaluated, for the draws that
+ * have a varying part (the tiler flags' Secondary Shader). */
+static enum mali_idvs_shading_mode
+idvs_shading_mode(struct panvk_cmd_buffer *cmdbuf)
+{
+   const bool varying_part = get_vs(cmdbuf)->info.vs.secondary_enable &&
+                             get_fs(cmdbuf) != NULL;
+
+   return PANVK_DEBUG(DVS) && varying_part ? MALI_IDVS_SHADING_MODE_DEFERRED
+                                           : MALI_IDVS_SHADING_MODE_EARLY;
+}
+#endif
+
 static void
 launch_draw(struct panvk_cmd_buffer *cmdbuf,
             const struct panvk_draw_info *draw)
@@ -3169,7 +3186,7 @@ launch_draw(struct panvk_cmd_buffer *cmdbuf,
 #if PAN_ARCH >= 12
             cs_trace_run_idvs2(b, tracing_ctx, tracing_scratch_regs,
                                flags_override.opaque[0], true, cs_undef(),
-                               MALI_IDVS_SHADING_MODE_EARLY);
+                               idvs_shading_mode(cmdbuf));
 #else
             cs_trace_run_idvs(b, tracing_ctx, tracing_scratch_regs,
                               flags_override.opaque[0], true,
@@ -3195,7 +3212,7 @@ launch_draw(struct panvk_cmd_buffer *cmdbuf,
 #if PAN_ARCH >= 12
          cs_trace_run_idvs2(b, tracing_ctx, tracing_scratch_regs,
                             flags_override.opaque[0], true, cs_undef(),
-                            MALI_IDVS_SHADING_MODE_EARLY);
+                            idvs_shading_mode(cmdbuf));
 #else
          cs_trace_run_idvs(b, tracing_ctx, tracing_scratch_regs,
                            flags_override.opaque[0], true,
@@ -3415,7 +3432,7 @@ launch_indirect_draw(struct panvk_cmd_buffer *cmdbuf,
 #if PAN_ARCH >= 12
             cs_trace_run_idvs2(b, tracing_ctx, tracing_scratch_regs,
                                flags_override.opaque[0], true, draw_id,
-                               MALI_IDVS_SHADING_MODE_EARLY);
+                               idvs_shading_mode(cmdbuf));
 #else
             cs_trace_run_idvs(
                b, tracing_ctx, tracing_scratch_regs, flags_override.opaque[0],
@@ -3441,7 +3458,7 @@ launch_indirect_draw(struct panvk_cmd_buffer *cmdbuf,
 #if PAN_ARCH >= 12
          cs_trace_run_idvs2(b, tracing_ctx, tracing_scratch_regs,
                             flags_override.opaque[0], true, draw_id,
-                            MALI_IDVS_SHADING_MODE_EARLY);
+                            idvs_shading_mode(cmdbuf));
 #else
          cs_trace_run_idvs(
             b, tracing_ctx, tracing_scratch_regs, flags_override.opaque[0],
