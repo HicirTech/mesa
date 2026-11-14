@@ -25,10 +25,15 @@
 #include "panvk_physical_device.h"
 
 #include "drm-uapi/drm_fourcc.h"
+#include "kmod/kbase_kmod.h"
+#include "util/os_misc.h"
+#include "util/os_time.h"
+#include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
 #include "util/u_drm.h"
 
+#include "vk_enum_to_str.h"
 #include "vk_format.h"
 #include "vk_log.h"
 #include "vk_object.h"
@@ -650,6 +655,83 @@ panvk_image_report_binding(struct panvk_device *dev, struct panvk_image *image,
    }
 }
 
+/* PANVK_IMAGE_STATS_FILE=<path>: what the bound images take per format and
+ * plane, appended to that file each time their total has grown by another
+ * 128 MiB or an image comes or goes 15 seconds after the last report, next to
+ * what the heap has handed out. It tells how much of a game's GPU memory is
+ * images, and how much of that the hidden planes of emulated BC formats are
+ * (panvk_bc_emu.h). Each report ends with the kbase backend's buffers by label,
+ * which is where the driver's own memory shows, and with what
+ * PANVK_POOL_STATS=1 counted (panvk_mempool.c).
+ */
+#define PANVK_IMAGE_STATS_STEP (128ll << 20)
+#define PANVK_IMAGE_STATS_PERIOD_US (15ll * 1000 * 1000)
+
+static simple_mtx_t image_stats_lock = SIMPLE_MTX_INITIALIZER;
+static struct {
+   VkFormat format;
+   int64_t count;
+   int64_t plane_bytes[2];
+} image_stats[128];
+static int64_t image_stats_total, image_stats_reported, image_stats_time;
+
+static void
+panvk_image_stats(struct panvk_device *dev, const struct panvk_image *image,
+                  int sign)
+{
+   const char *path = os_get_option("PANVK_IMAGE_STATS_FILE");
+   if (!path)
+      return;
+
+   simple_mtx_lock(&image_stats_lock);
+
+   /* Formats past the table's size share its last entry. */
+   unsigned slot = 0;
+   while (slot < ARRAY_SIZE(image_stats) - 1 && image_stats[slot].format &&
+          image_stats[slot].format != image->vk.format)
+      slot++;
+
+   image_stats[slot].format = image->vk.format;
+   image_stats[slot].count += sign;
+   for (unsigned plane = 0; plane < MIN2(image->plane_count, 2); plane++) {
+      const int64_t bytes = image->planes[plane].plane.layout.data_size_B;
+
+      image_stats[slot].plane_bytes[plane] += sign * bytes;
+      image_stats_total += sign * bytes;
+   }
+
+   const int64_t now = os_time_get();
+   FILE *out = NULL;
+   if (image_stats_total >= image_stats_reported + PANVK_IMAGE_STATS_STEP ||
+       now >= image_stats_time + PANVK_IMAGE_STATS_PERIOD_US) {
+      image_stats_reported = image_stats_total;
+      image_stats_time = now;
+      out = fopen(path, "a");
+   }
+
+   if (out) {
+      const struct panvk_physical_device *phys_dev =
+         to_panvk_physical_device(dev->vk.physical);
+
+      fprintf(out, "images %" PRId64 " MiB, heap %" PRIu64 " MiB\n",
+              image_stats_total >> 20,
+              (uint64_t)p_atomic_read(&phys_dev->memory.budget->heap_used) >> 20);
+      for (unsigned i = 0; i < ARRAY_SIZE(image_stats); i++) {
+         if (!image_stats[i].count)
+            continue;
+         fprintf(out, "  %s: %" PRId64 " images, %" PRId64 " + %" PRId64 " MiB\n",
+                 vk_Format_to_str(image_stats[i].format), image_stats[i].count,
+                 image_stats[i].plane_bytes[0] >> 20,
+                 image_stats[i].plane_bytes[1] >> 20);
+      }
+      pan_kmod_kbase_mem_report(out);
+      panvk_pool_stats_report(out);
+      fclose(out);
+   }
+
+   simple_mtx_unlock(&image_stats_lock);
+}
+
 static uint64_t
 panvk_image_get_sparse_size(const struct panvk_image *image)
 {
@@ -928,6 +1010,11 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
       return;
 
    panvk_bc_emu_untrack_image(device, image);
+
+   /* What panvk_image_bind() counted. */
+   if (!(image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR) &&
+       !is_disjoint(image) && image->planes[0].plane.base)
+      panvk_image_stats(device, image, -1);
 
    if (image->vk.create_flags &
        VK_IMAGE_CREATE_2_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
@@ -1471,6 +1558,7 @@ panvk_image_bind(struct panvk_device *dev,
          panvk_image_plane_bind_mem(dev, &image->planes[plane], mem, offset);
       panvk_image_report_binding(dev, image,
                                  VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
+      panvk_image_stats(dev, image, 1);
    }
 
    if (!!(image->vk.create_flags &
