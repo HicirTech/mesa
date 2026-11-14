@@ -538,6 +538,9 @@ struct panvk_tls_state {
    struct pan_ptr desc;
    struct pan_tls_info info;
    unsigned max_wg_count;
+   /* The device's thread stacks desc points at once the command buffer has ended: a reference,
+    * dropped when the command buffer is reset. */
+   struct panvk_priv_bo *stacks;
 };
 
 struct panvk_cond_render_state {

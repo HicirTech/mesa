@@ -42,22 +42,62 @@
 #include "vk_format.h"
 #include "vk_synchronization.h"
 
+/* A reference on the device's thread stacks, replaced by larger ones first if a thread needs more
+ * than they give it. *thread_size comes back as the size every job using them has to declare. */
+static struct panvk_priv_bo *
+get_thread_stacks(struct panvk_device *dev, uint32_t *thread_size)
+{
+   const struct pan_kmod_dev_props *props =
+      &to_panvk_physical_device(dev->vk.physical)->kmod.dev->props;
+   const uint32_t needed = 16u << pan_get_stack_shift(*thread_size);
+   struct panvk_priv_bo *stacks = NULL;
+
+   simple_mtx_lock(&dev->thread_stacks.lock);
+
+   if (dev->thread_stacks.thread_size < needed) {
+      const unsigned size =
+         pan_get_total_stack_size(needed, pan_query_thread_tls_alloc(props),
+                                  pan_query_core_id_range(props));
+      struct panvk_priv_bo *larger;
+
+      if (panvk_priv_bo_create(
+             dev, size,
+             panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_NO_MMAP),
+             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "Thread stacks",
+             &larger) == VK_SUCCESS) {
+         panvk_priv_bo_unref(dev->thread_stacks.bo);
+         dev->thread_stacks.bo = larger;
+         dev->thread_stacks.thread_size = needed;
+      }
+   }
+
+   if (dev->thread_stacks.thread_size >= needed) {
+      stacks = panvk_priv_bo_ref(dev->thread_stacks.bo);
+      *thread_size = dev->thread_stacks.thread_size;
+   }
+
+   simple_mtx_unlock(&dev->thread_stacks.lock);
+
+   return stacks;
+}
+
 static void
 emit_tls(struct panvk_cmd_buffer *cmdbuf)
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   struct panvk_physical_device *phys_dev =
-      to_panvk_physical_device(dev->vk.physical);
-   unsigned core_id_range = pan_query_core_id_range(&phys_dev->kmod.dev->props);
 
    if (cmdbuf->state.tls.info.tls.size) {
-      unsigned thread_tls_alloc =
-         pan_query_thread_tls_alloc(&phys_dev->kmod.dev->props);
-      unsigned size = pan_get_total_stack_size(cmdbuf->state.tls.info.tls.size,
-                                               thread_tls_alloc, core_id_range);
+      uint32_t thread_size = cmdbuf->state.tls.info.tls.size;
 
-      cmdbuf->state.tls.info.tls.ptr =
-         panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
+      assert(!cmdbuf->state.tls.stacks);
+      cmdbuf->state.tls.stacks = get_thread_stacks(dev, &thread_size);
+      if (cmdbuf->state.tls.stacks) {
+         cmdbuf->state.tls.info.tls.size = thread_size;
+         cmdbuf->state.tls.info.tls.ptr = cmdbuf->state.tls.stacks->addr.dev;
+      } else {
+         vk_command_buffer_set_error(&cmdbuf->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
    }
 
    assert(!cmdbuf->state.tls.info.wls.size);
@@ -942,6 +982,7 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)
       cs_builder_fini(&cmdbuf->state.cs[i].builder);
 
+   panvk_priv_bo_unref(cmdbuf->state.tls.stacks);
    memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
    init_cs_builders(cmdbuf);
 }
@@ -964,6 +1005,7 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
    panvk_pool_cleanup(&cmdbuf->cs_pool);
    panvk_pool_cleanup(&cmdbuf->desc_pool);
    panvk_pool_cleanup(&cmdbuf->tls_pool);
+   panvk_priv_bo_unref(cmdbuf->state.tls.stacks);
    list_splicetail(&cmdbuf->push_sets, &pool->push_sets);
    vk_command_buffer_finish(&cmdbuf->vk);
    vk_free(&dev->vk.alloc, cmdbuf);

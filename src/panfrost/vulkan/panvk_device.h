@@ -79,6 +79,19 @@ struct panvk_device {
     * every batch (see panlib_tess_prefix_sum). */
    struct panvk_priv_bo *tess_heap;
 
+   /* v10+: the thread stacks every command buffer shares. The GPU finds a thread's stack from its
+    * core and thread number, so threads of different jobs never get the same bytes as long as all
+    * jobs use one stack size: thread_size, which only grows, and a new buffer then replaces this
+    * one. A command buffer holds a reference on the buffer its local storage descriptor names, so
+    * an outgrown buffer lives until the last command buffer recorded with it is reset. One buffer
+    * per command buffer was 92 MiB each on the Tab S10 Ultra (1 KiB for each of 4096 threads on
+    * 23 core numbers), 1.7 GiB in Deep Rock Galactic. */
+   struct {
+      simple_mtx_t lock;
+      struct panvk_priv_bo *bo;
+      uint32_t thread_size;
+   } thread_stacks;
+
    /* v6/v7: the internal geometry shaders that draw triangles as lines ([0]) or points ([1]) for
     * VK_POLYGON_MODE_LINE/POINT, built on first use (panvk_per_arch(polygon_mode_gs)). */
    struct {

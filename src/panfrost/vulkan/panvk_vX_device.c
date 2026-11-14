@@ -784,6 +784,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 
 #if PAN_ARCH >= 10
    simple_mtx_init(&device->poly_heap.init_lock, mtx_plain);
+   simple_mtx_init(&device->thread_stacks.lock, mtx_plain);
 #else
    result = panvk_per_arch(device_init_poly_heap)(device);
    if (result != VK_SUCCESS)
@@ -896,6 +897,8 @@ err_free_priv_bos:
    panvk_priv_bo_unref(device->poly_heap.buffer);
 #if PAN_ARCH >= 10
    simple_mtx_destroy(&device->poly_heap.init_lock);
+   panvk_priv_bo_unref(device->thread_stacks.bo);
+   simple_mtx_destroy(&device->thread_stacks.lock);
 #endif
    panvk_priv_bo_unref(device->tess_heap);
    panvk_priv_bo_unref(device->tiler_heap[0]);
@@ -959,6 +962,8 @@ panvk_per_arch(destroy_device)(struct panvk_device *device,
    panvk_priv_bo_unref(device->poly_heap.buffer);
 #if PAN_ARCH >= 10
    simple_mtx_destroy(&device->poly_heap.init_lock);
+   panvk_priv_bo_unref(device->thread_stacks.bo);
+   simple_mtx_destroy(&device->thread_stacks.lock);
 #endif
    panvk_priv_bo_unref(device->tess_heap);
    panvk_priv_bo_unref(device->tiler_heap[0]);
