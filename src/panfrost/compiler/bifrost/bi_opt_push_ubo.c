@@ -28,8 +28,18 @@ bi_is_pushable_ubo(bi_context *ctx, bi_instr *ins)
    unsigned ubo = pan_res_handle_get_index(ins->src[1].value);
    unsigned offset = ins->src[0].value;
 
-   return ctx->inputs->fau.pushable_ubos & BITFIELD_BIT(ubo) &&
+   /* pushable_ubos indexes resource table 0: Gallium's UBO table, PanVK's dynamic buffers. */
+   return pan_res_handle_get_table(ins->src[1].value) == 0 &&
+          ctx->inputs->fau.pushable_ubos & BITFIELD_BIT(ubo) &&
           (offset & 0x3) == 0;
+}
+
+/* Gallium keeps its sysvals, the blend constants first, in UBO 1 and reserves no FAU range. A
+ * driver that reserves one (PanVK) pushes its sysvals and blend constants itself. */
+static bool
+bi_has_sysval_ubo(bi_context *ctx)
+{
+   return ctx->info.fau->reserved == 0;
 }
 
 /* Represents use data for a single UBO */
@@ -51,7 +61,8 @@ static struct bi_ubo_analysis
 bi_analyze_ranges(bi_context *ctx)
 {
    struct bi_ubo_analysis res = {
-      .nr_blocks = ctx->nir->info.num_ubos + 1,
+      .nr_blocks = MAX2(ctx->nir->info.num_ubos + 1,
+                        util_last_bit(ctx->inputs->fau.pushable_ubos)),
    };
 
    res.blocks = calloc(res.nr_blocks, sizeof(struct bi_ubo_block));
@@ -69,7 +80,7 @@ bi_analyze_ranges(bi_context *ctx)
 
       /* Blend constants are handled by bi_pick_blend_constants, don't push
        * them a second time. */
-      if (ctx->stage == MESA_SHADER_FRAGMENT) {
+      if (ctx->stage == MESA_SHADER_FRAGMENT && bi_has_sysval_ubo(ctx)) {
          /* PAN_UBO_SYSVALS from the gallium driver */
          unsigned sysval_ubo = 1;
          if(ubo == sysval_ubo && word == 0)
@@ -153,7 +164,7 @@ bi_opt_push_ubo(bi_context *ctx)
    struct pan_fau_layout *fau = ctx->info.fau;
 
    /* We first pick the blend constants, those cannot be reordered */
-   if (ctx->stage == MESA_SHADER_FRAGMENT)
+   if (ctx->stage == MESA_SHADER_FRAGMENT && bi_has_sysval_ubo(ctx))
       bi_pick_blend_constants(ctx, &analysis);
 
    ctx->ubo_reloc.start = fau->count;

@@ -887,7 +887,8 @@ bi_emit_load_ubo(bi_builder *b, nir_intrinsic_instr *instr)
 static void
 bi_emit_load_push_constant(bi_builder *b, nir_intrinsic_instr *instr)
 {
-   assert(!b->shader->inputs->fau.pushable_ubos &&
+   /* Push constants live in the driver-reserved FAU range, pushed UBO words go after it. */
+   assert((!b->shader->inputs->fau.pushable_ubos || b->shader->inputs->fau.reserved) &&
           "can't mix push constant forms");
 
    nir_src *offset = &instr->src[0];
