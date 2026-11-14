@@ -14,6 +14,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 struct pan_kmod_dev;
 struct pan_kmod_bo;
@@ -65,6 +66,9 @@ struct pan_kmod_kbase_atom {
  * otherwise reach for a DRM ioctl has to ask, because -- measured, see kbase_kmod.c -- this
  * kernel returns SUCCESS for DRM ioctls it does not implement. */
 bool pan_kmod_dev_is_kbase(const struct pan_kmod_dev *dev);
+
+/* What this process has mapped on the GPU now, by label (see kbase_kmod.c). */
+void pan_kmod_kbase_mem_report(FILE *out);
 
 /* Sync objects for kbase, which has none: binary objects kept in this process, with the DRM
  * syncobj semantics Mesa's runtime expects (see kbase_kmod.c). Each call returns a new provider

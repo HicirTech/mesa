@@ -798,6 +798,61 @@ kbase_format_code_addr(uintptr_t pc, char *buf, size_t len)
    }
 }
 
+/* Appends to out what is mapped now, summed by the label PanVK gave it and, for what has none, by
+ * the code that asked for it: where a process's GPU memory is beyond the heap the application
+ * allocates from (PANVK_IMAGE_STATS_FILE). */
+void
+pan_kmod_kbase_mem_report(FILE *out)
+{
+   struct {
+      char label[sizeof(((struct kbase_live_map *)0)->label)];
+      uintptr_t caller;
+      uint64_t size;
+      uint32_t count;
+   } sums[64];
+   unsigned n = 0;
+   uint64_t total = 0;
+
+   pthread_mutex_lock(&kbase_live_lock);
+   for (uint32_t i = 0; i < kbase_live_count; i++) {
+      const struct kbase_live_map *m = &kbase_live[i];
+
+      /* A repeated mapping shows a BO a second time. */
+      if (m->flags & KBASE_LIVE_REPEATED)
+         continue;
+
+      unsigned s = 0;
+      while (s < n && (strcmp(sums[s].label, m->label) ||
+                       (!m->label[0] && sums[s].caller != m->caller)))
+         s++;
+      if (s == n && n < ARRAY_SIZE(sums)) {
+         memcpy(sums[n].label, m->label, sizeof(sums[n].label));
+         sums[n].caller = m->caller;
+         sums[n].size = 0;
+         sums[n].count = 0;
+         n++;
+      } else if (s == n) {
+         /* Past the table: its last entry takes the rest. */
+         s = n - 1;
+      }
+      sums[s].size += m->size;
+      sums[s].count++;
+      total += m->size;
+   }
+   pthread_mutex_unlock(&kbase_live_lock);
+
+   fprintf(out, "mapped %" PRIu64 " MiB\n", total >> 20);
+   for (unsigned s = 0; s < n; s++) {
+      char site[96];
+
+      if (!(sums[s].size >> 20))
+         continue;
+      kbase_format_code_addr(sums[s].caller, site, sizeof(site));
+      fprintf(out, "  %s: %u buffers, %" PRIu64 " MiB\n", sums[s].label[0] ? sums[s].label : site,
+              sums[s].count, sums[s].size >> 20);
+   }
+}
+
 /* Writes into buf what is alive at addr now: the live mapping covering it, or else the nearest
  * one on each side. For an address in the guard page after a BO, tail gets that BO's last 128
  * bytes as 64-bit words (empty otherwise): what was being read past. */
