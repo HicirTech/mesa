@@ -213,7 +213,10 @@ init_shader_caches(struct panvk_physical_device *device,
    char timestamp[BLAKE3_HEX_LEN];
    _mesa_blake3_format(timestamp, instance->driver_build_sha);
 
-   const uint64_t driver_flags = pan_get_compiler_flags(pan_arch(gpu_id));
+   /* The compiler flags take the low 32 bits. PANVK_DEBUG=push_ubo changes what shaders
+    * compile to (pushed UBO words), so it gets a key of its own. */
+   const uint64_t driver_flags = pan_get_compiler_flags(pan_arch(gpu_id)) |
+                                 (PANVK_DEBUG(PUSH_UBO) ? BITFIELD64_BIT(32) : 0);
 #if DETECT_OS_ANDROID
    panvk_android_disk_cache_dir();
 #endif

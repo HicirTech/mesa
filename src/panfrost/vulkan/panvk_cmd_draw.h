@@ -173,6 +173,18 @@ struct panvk_cmd_graphics_state {
     */
    uint64_t idvs_sr_valid;
    uint32_t idvs_sr[64];
+
+   /* The compute job that copies pushed UBO words into the FAU blocks of the
+    * draws recorded after it (pushed_ubo_gather_add): its entries, how many
+    * there are so far, and where the job reads that number when it runs.
+    * entries is NULL when the next draw that pushes has to issue a new job,
+    * as the first one of every render pass does.
+    */
+   struct {
+      struct libpan_fau_copy *entries;
+      uint32_t *count_slot;
+      uint32_t count;
+   } pushed_ubos;
 #endif
    struct panvk_graphics_sysvals sysvals;
 
@@ -576,6 +588,26 @@ cached_fs_required(ASSERTED const struct panvk_cmd_graphics_state *state,
       if (__set_fs_push_dirty)                                                 \
          gfx_state_set_dirty(__cmdbuf, FS_PUSH_UNIFORMS);                      \
    } while (0)
+
+#if PAN_ARCH >= 10
+/* Pushed UBO words are copied from the dynamic buffers bound when a shader's
+ * push uniforms are prepared (copy_pushed_ubos). Call this when those buffers
+ * are rebound or may have been written; shaders that push none keep their push
+ * uniforms. */
+static inline void
+set_pushed_ubos_dirty(struct panvk_cmd_graphics_state *state)
+{
+   const struct panvk_shader_variant *vs =
+      panvk_shader_hw_variant(state->vs.shader);
+   const struct panvk_shader_variant *fs =
+      panvk_shader_only_variant(state->fs.shader);
+
+   if (vs && vs->fau.pushed_ubos)
+      BITSET_SET(state->dirty, PANVK_CMD_GRAPHICS_DIRTY_VS_PUSH_UNIFORMS);
+   if (fs && fs->fau.pushed_ubos)
+      BITSET_SET(state->dirty, PANVK_CMD_GRAPHICS_DIRTY_FS_PUSH_UNIFORMS);
+}
+#endif
 
 #if PAN_ARCH >= 10 && PAN_ARCH < 14
 VkResult

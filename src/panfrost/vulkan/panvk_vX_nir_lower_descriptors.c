@@ -1554,6 +1554,7 @@ upload_shader_desc_info(struct panvk_device *dev,
    if (lower_info->dyn_bufs.count != 0)
       memcpy(desc_info->dyn_bufs.map, lower_info->dyn_bufs.map,
              lower_info->dyn_bufs.count * sizeof(*desc_info->dyn_bufs.map));
+   desc_info->dyn_bufs_start = lower_info->dyn_bufs_start;
 #endif
 
    desc_info->used_set_mask = lower_info->used_set_mask;

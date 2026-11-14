@@ -1131,3 +1131,19 @@ panlib_v9_gs_job(global struct libpan_v9_gs_job *j)
    }
 }
 #endif
+
+#if PAN_ARCH >= 10
+/* The pushed uniform buffer words of the draws that follow, one thread per run. The command
+ * stream takes the job size from a count the driver goes on writing after it has issued the
+ * job. */
+KERNEL(1)
+panlib_gather_fau(global const struct libpan_fau_copy *copies)
+{
+   const struct libpan_fau_copy copy = copies[cl_global_id.x];
+   global const uint32_t *src = (global const uint32_t *)copy.src;
+   global uint32_t *dst = (global uint32_t *)copy.dst;
+
+   for (uint32_t i = 0; i < copy.words; i++)
+      dst[i] = src[i];
+}
+#endif

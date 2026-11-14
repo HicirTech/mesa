@@ -1739,9 +1739,17 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
    }
 
    /* Pad the total to the 64-bit-aligned FAU count; it's used to initialize the
-    * RSD in pan_shader_prepare_rsd().
+    * RSD in pan_shader_prepare_rsd(). The padding is a zero constant, so every
+    * word past the reserved range stays a constant or a pushed UBO word
+    * (copy_pushed_ubos).
     */
-   shader->info.fau.count = shader->fau.total_count * 2;
+   while (shader->info.fau.count < shader->fau.total_count * 2)
+      pan_fau_emit_const(&shader->info.fau, 0);
+
+   pan_fau_foreach_reloc(&shader->info.fau, w) {
+      shader->fau.pushed_ubos = true;
+      break;
+   }
 
 #if PAN_ARCH < 9
    /* Patch the descriptor count */
@@ -2228,6 +2236,23 @@ panvk_vs_xfb_passthrough(const nir_shader *nir)
           panvk_gs_xfb_table(nir->xfb_info, table) > 0;
 }
 
+#if PAN_ARCH >= 10
+/* With PANVK_DEBUG=push_ubo, constant reads from a shader's dynamic uniform buffers move to the
+ * FAU: their addresses are known when a draw is recorded, so a compute job ahead of the draw
+ * copies the pushed words in (copy_pushed_ubos, csf/panvk_vX_cmd_draw.c). Only the hardware
+ * vertex shader and the fragment shader of an IDVS draw get there. Off by default: every draw
+ * then prepares its own FAU block, which a draw-bound frame pays for on the CPU. */
+static uint32_t
+pushable_dyn_ubos(const struct panvk_shader_desc_info *desc_info)
+{
+   if (!PANVK_DEBUG(PUSH_UBO) || desc_info->dyn_bufs_start >= 32)
+      return 0;
+
+   const uint32_t count = MIN2(desc_info->dyn_bufs.count, 32 - desc_info->dyn_bufs_start);
+   return count ? BITFIELD_RANGE(desc_info->dyn_bufs_start, count) : 0;
+}
+#endif
+
 static VkResult
 panvk_compile_shader(struct panvk_device *dev,
                      struct vk_shader_compile_info *info,
@@ -2433,7 +2458,12 @@ panvk_compile_shader(struct panvk_device *dev,
 
          variant->own_bin = true;
 
-         result = panvk_compile_nir(dev, nir, info->flags, &inputs, state,
+         struct pan_compile_inputs hw_inputs = inputs;
+#if PAN_ARCH >= 10
+         if (v == PANVK_VS_VARIANT_HW)
+            hw_inputs.fau.pushable_ubos = pushable_dyn_ubos(&shader->desc_info);
+#endif
+         result = panvk_compile_nir(dev, nir, info->flags, &hw_inputs, state,
                                     noperspective_varyings,
                                     &shader->desc_info, variant);
 
@@ -2520,7 +2550,11 @@ panvk_compile_shader(struct panvk_device *dev,
 
       variant->own_bin = true;
 
-      result = panvk_compile_nir(dev, nir, info->flags, &inputs, state,
+      struct pan_compile_inputs fs_inputs = inputs;
+#if PAN_ARCH >= 10
+      fs_inputs.fau.pushable_ubos = pushable_dyn_ubos(&shader->desc_info);
+#endif
+      result = panvk_compile_nir(dev, nir, info->flags, &fs_inputs, state,
                                  noperspective_varyings,
                                  &shader->desc_info, variant);
       if (result != VK_SUCCESS) {
@@ -3094,6 +3128,7 @@ shader_desc_info_deserialize(struct panvk_device *dev,
    blob_copy_bytes(blob, shader->desc_info.dyn_bufs.map,
                    sizeof(*shader->desc_info.dyn_bufs.map) *
                       shader->desc_info.dyn_bufs.count);
+   shader->desc_info.dyn_bufs_start = blob_read_uint32(blob);
    shader->desc_info.fs_varying_attr_desc_count = blob_read_uint32(blob);
 
    const uint32_t embedded_count = blob_read_uint32(blob);
@@ -3282,6 +3317,7 @@ shader_desc_info_serialize(struct blob *blob,
    blob_write_bytes(blob, shader->desc_info.dyn_bufs.map,
                     sizeof(*shader->desc_info.dyn_bufs.map) *
                        shader->desc_info.dyn_bufs.count);
+   blob_write_uint32(blob, shader->desc_info.dyn_bufs_start);
    blob_write_uint32(blob, shader->desc_info.fs_varying_attr_desc_count);
 
    /* Nonzero exactly when the shader uses heaps. The GPU never writes the

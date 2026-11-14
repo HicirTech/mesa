@@ -2224,6 +2224,128 @@ vt_sr_move64(struct panvk_cmd_buffer *cmdbuf, struct cs_builder *b,
    vt_sr_move32(cmdbuf, b, sr + 1, (uint32_t)(val >> 32));
 }
 
+static void vt_precomp_begin(struct panvk_cmd_buffer *cmdbuf, struct panvk_precomp_ctx *ctx,
+                             uint64_t *saved);
+static void vt_precomp_end(struct panvk_cmd_buffer *cmdbuf, uint64_t saved);
+
+/* The FAU words a shader's pushed UBO reads became (bi_opt_push_ubo) are filled in on the GPU,
+ * because a buffer's contents may change after a draw is recorded (a copy earlier in the command
+ * buffer) while its address may not. One compute job on the vertex/tiler queue copies them for
+ * the draws that follow it in the render pass (panlib_gather_fau): the first of those draws
+ * issues the job, and the job takes its size from a count the later draws go on raising.
+ * Copying in each draw's own command stream made the stream wait on memory twice per draw.
+ */
+#define PUSHED_UBO_GATHER_ENTRIES 2048
+
+/* The count comes first, in a slot as wide as an entry's alignment. */
+#define PUSHED_UBO_GATHER_HEADER 16
+
+static VkResult
+pushed_ubo_gather_begin(struct panvk_cmd_buffer *cmdbuf)
+{
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+   const struct pan_ptr mem = panvk_cmd_alloc_dev_mem(
+      cmdbuf, desc,
+      PUSHED_UBO_GATHER_HEADER + PUSHED_UBO_GATHER_ENTRIES * sizeof(struct libpan_fau_copy),
+      PUSHED_UBO_GATHER_HEADER);
+   if (!mem.gpu)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   struct panvk_precomp_ctx precomp_ctx;
+   uint64_t saved;
+   vt_precomp_begin(cmdbuf, &precomp_ctx, &saved);
+   if (!saved)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   cs_update_compute_ctx(b) {
+      cs_move64_to(b, cs_scratch_reg64(b, 0), mem.gpu);
+      cs_load32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_X), cs_scratch_reg64(b, 0), 0);
+      cs_flush_loads(b);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Y), 1);
+      cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), 1);
+   }
+   panlib_gather_fau(&precomp_ctx, panlib_dynamic_csf(), PANLIB_BARRIER_NONE,
+                     mem.gpu + PUSHED_UBO_GATHER_HEADER);
+   vt_precomp_end(cmdbuf, saved);
+
+   gfx->pushed_ubos.entries =
+      (struct libpan_fau_copy *)((uint8_t *)mem.cpu + PUSHED_UBO_GATHER_HEADER);
+   gfx->pushed_ubos.count_slot = mem.cpu;
+   gfx->pushed_ubos.count = 0;
+   return VK_SUCCESS;
+}
+
+static VkResult
+pushed_ubo_gather_add(struct panvk_cmd_buffer *cmdbuf, uint64_t src, uint64_t dst,
+                      uint32_t words)
+{
+   struct panvk_cmd_graphics_state *gfx = &cmdbuf->state.gfx;
+
+   if (!gfx->pushed_ubos.entries || gfx->pushed_ubos.count == PUSHED_UBO_GATHER_ENTRIES) {
+      const VkResult result = pushed_ubo_gather_begin(cmdbuf);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   gfx->pushed_ubos.entries[gfx->pushed_ubos.count++] =
+      (struct libpan_fau_copy){.src = src, .dst = dst, .words = words};
+   *gfx->pushed_ubos.count_slot = gfx->pushed_ubos.count;
+   return VK_SUCCESS;
+}
+
+/* Words past the end of the buffer read as zero, as the loads they replace would. Runs of
+ * consecutive words from one buffer are copied together. */
+static VkResult
+copy_pushed_ubos(struct panvk_cmd_buffer *cmdbuf,
+                 const struct panvk_descriptor_state *desc_state,
+                 const struct panvk_shader_desc_info *desc_info,
+                 const struct panvk_shader_variant *shader, struct pan_ptr fau,
+                 uint32_t repeat_count)
+{
+   const struct pan_fau_layout *layout = &shader->info.fau;
+   const uint32_t repeat_words = shader->fau.total_count * 2;
+   uint32_t *fau_words = fau.cpu;
+
+   for (uint32_t r = 0; r < repeat_count; r++) {
+      for (uint32_t w = layout->reserved; w < layout->count;) {
+         if (BITSET_TEST(layout->is_const, w)) {
+            w++;
+            continue;
+         }
+
+         const struct pan_ubo_relocation first = layout->words[w].relocation;
+         uint32_t n = 1;
+         while (w + n < layout->count && !BITSET_TEST(layout->is_const, w + n) &&
+                layout->words[w + n].relocation.ubo == first.ubo &&
+                layout->words[w + n].relocation.offset == first.offset + 4 * n)
+            n++;
+
+         assert(first.ubo >= desc_info->dyn_bufs_start &&
+                first.ubo - desc_info->dyn_bufs_start < desc_info->dyn_bufs.count);
+         const struct panvk_dyn_buf_range buf = panvk_per_arch(cmd_get_dyn_buf)(
+            desc_state, desc_info, first.ubo - desc_info->dyn_bufs_start);
+
+         const uint32_t word = r * repeat_words + w;
+         uint32_t in_bounds = 0;
+         while (in_bounds < n && first.offset + 4 * (in_bounds + 1) <= buf.size)
+            in_bounds++;
+         for (uint32_t k = in_bounds; k < n; k++)
+            fau_words[word + k] = 0;
+
+         if (in_bounds) {
+            const VkResult result = pushed_ubo_gather_add(
+               cmdbuf, buf.address + first.offset, fau.gpu + (uint64_t)word * 4, in_bounds);
+            if (result != VK_SUCCESS)
+               return result;
+         }
+         w += n;
+      }
+   }
+
+   return VK_SUCCESS;
+}
+
 static VkResult
 prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
                       const struct panvk_draw_info *draw,
@@ -2251,6 +2373,11 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
          cmdbuf, vs, &push_uniforms, vs_repeat_count);
       if (result != VK_SUCCESS)
          return result;
+      result = copy_pushed_ubos(cmdbuf, &cmdbuf->state.gfx.desc_state,
+                                &cmdbuf->state.gfx.vs.shader->desc_info, vs, push_uniforms,
+                                vs_repeat_count);
+      if (result != VK_SUCCESS)
+         return result;
       cmdbuf->state.gfx.vs.push_uniforms = push_uniforms.gpu;
 
       cs_update_vt_ctx(b) {
@@ -2267,6 +2394,11 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
          struct pan_ptr push_uniforms;
          result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
             cmdbuf, fs, &push_uniforms, 1);
+         if (result != VK_SUCCESS)
+            return result;
+         result = copy_pushed_ubos(cmdbuf, &cmdbuf->state.gfx.desc_state,
+                                   &cmdbuf->state.gfx.fs.shader->desc_info, fs, push_uniforms,
+                                   1);
          if (result != VK_SUCCESS)
             return result;
          cmdbuf->state.gfx.fs.push_uniforms = push_uniforms.gpu;
@@ -3910,6 +4042,9 @@ gs_draw(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_info *draw,
       patch_vs_attribs(cmdbuf, &patch);
    }
    panvk_per_arch(cmd_prepare_draw_sysvals)(cmdbuf, draw, fs);
+   /* A vertex shader feeding the emulation is compiled without pushed UBO words, which only
+    * prepare_push_uniforms() fills in. */
+   assert(!vs->fau.pushed_ubos);
    struct pan_ptr vs_pu;
    if (panvk_per_arch(cmd_prepare_gfx_push_uniforms)(cmdbuf, vs, &vs_pu, 1) != VK_SUCCESS)
       return;
@@ -4330,6 +4465,9 @@ tess_draw(struct panvk_cmd_buffer *cmdbuf, const struct panvk_draw_info *draw, u
       patch_vs_attribs(cmdbuf, &patch);
    }
    panvk_per_arch(cmd_prepare_draw_sysvals)(cmdbuf, draw, fs);
+   /* A vertex shader feeding the emulation is compiled without pushed UBO words, which only
+    * prepare_push_uniforms() fills in. */
+   assert(!vs->fau.pushed_ubos);
    struct pan_ptr vs_pu;
    if (panvk_per_arch(cmd_prepare_gfx_push_uniforms)(cmdbuf, vs, &vs_pu, 1) != VK_SUCCESS)
       return;
@@ -5026,6 +5164,11 @@ panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
    bool resuming = pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT;
 
    panvk_per_arch(cmd_init_render_state)(cmdbuf, pRenderingInfo);
+
+   /* Buffers may have been written since the last pass (copies cannot run inside one): this
+    * pass's draws copy their pushed words again, with a gather job of their own. */
+   set_pushed_ubos_dirty(&cmdbuf->state.gfx);
+   cmdbuf->state.gfx.pushed_ubos.entries = NULL;
 
    /* Renderpass lowering can fold an initial layout transition into
     * CmdBeginRendering() and report the old layout through

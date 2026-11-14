@@ -381,6 +381,8 @@ struct panvk_shader_fau_info {
    BITSET_DECLARE(used_push_consts, MAX_PUSH_CONST_FAUS);
    uint32_t sysval_count;
    uint32_t total_count;
+   /* Some FAU words are pushed UBO words, which draws copy in (copy_pushed_ubos). */
+   bool pushed_ubos;
 };
 
 struct panvk_shader_desc_info {
@@ -404,6 +406,8 @@ struct panvk_shader_desc_info {
       uint32_t map[MAX_DYNAMIC_BUFFERS];
       uint32_t count;
    } dyn_bufs;
+   /* Index of the first dynamic buffer in resource table 0. */
+   uint32_t dyn_bufs_start;
    uint32_t fs_varying_attr_desc_count;
 
    /* VK_EXT_descriptor_heap: the shader reads the bound heaps through the

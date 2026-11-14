@@ -399,6 +399,9 @@ panvk_per_arch(CmdBindDescriptorSets2KHR)(
                                pBindDescriptorSetsInfo);
 
       gfx_state_set_dirty(cmdbuf, DESC_STATE);
+#if PAN_ARCH >= 10
+      set_pushed_ubos_dirty(&cmdbuf->state.gfx);
+#endif
    }
 
    if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {

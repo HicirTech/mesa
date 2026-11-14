@@ -172,3 +172,14 @@ struct libpan_v9_gs_job {
    uint32_t strides[16];
 };
 #endif
+
+#if PAN_ARCH >= 10
+/* One run of 32-bit words for panlib_gather_fau: uniform buffer words on their way into a
+ * draw's FAU block. */
+struct libpan_fau_copy {
+   uint64_t src;
+   uint64_t dst;
+   uint32_t words;
+   uint32_t pad;
+};
+#endif
