@@ -230,7 +230,7 @@ prepare_attr_buf_descs(struct panvk_image_view *view)
       assert(log2_nr_samples <= BITFIELD_MASK(3));
       assert(hw_fmt <= BITFIELD_MASK(22));
 
-      cfg.type = image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR
+      cfg.type = plane_props->modifier == DRM_FORMAT_MOD_LINEAR
                     ? MALI_ATTRIBUTE_TYPE_3D_LINEAR
                     : MALI_ATTRIBUTE_TYPE_3D_INTERLEAVED;
       cfg.pointer = image->planes[plane_idx].plane.base + offset;

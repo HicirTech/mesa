@@ -171,6 +171,23 @@ select_plane_pfmt(struct panvk_image *image, uint64_t mod, unsigned plane)
    return vk_format_to_pipe_format(plane_format);
 }
 
+/* The modifier of a plane of an image with modifier mod. An emulated BC image (panvk_bc_emu.h)
+ * keeps the blocks the application wrote in plane 0, which no texture unit samples: the
+ * transcoder and copies go through views of uncompressed formats, which rules out the 16x16
+ * tiling, and the 64K one spends a whole tile on each small mip level. It is linear, and the
+ * image's modifier is the one of the hidden plane that is sampled. */
+static uint64_t
+select_plane_mod(const struct panvk_image *image, uint64_t mod, unsigned plane)
+{
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(image->vk.base.device->physical);
+
+   if (plane == 0 && panvk_bc_emu_format(phys_dev, image->vk.format))
+      return DRM_FORMAT_MOD_LINEAR;
+
+   return mod;
+}
+
 static bool
 panvk_image_can_use_mod(struct panvk_image *image,
                         const struct pan_image_usage *iusage, uint64_t mod,
@@ -191,9 +208,16 @@ panvk_image_can_use_mod(struct panvk_image *image,
    assert(image->vk.tiling == VK_IMAGE_TILING_OPTIMAL ||
           image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
 
+   const bool bc_emu = panvk_bc_emu_format(phys_dev, image->vk.format);
+
    if (drm_is_afbc(mod)) {
       /* AFBC explicitly disabled. */
       if (PANVK_DEBUG(NO_AFBC))
+         return false;
+
+      /* The transcoder fills the hidden plane of an emulated BC image from a
+       * compute shader, which cannot write AFBC. */
+      if (bc_emu)
          return false;
 
       /* The application asked for an uncompressed image. */
@@ -260,14 +284,21 @@ panvk_image_can_use_mod(struct panvk_image *image,
        * accessing non-compressed image views (coordinate patching for
        * sampled/storage image, frag_coord patching for color attachments). Let's
        * keep things simple for now and make all compressed images that
-       * have VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT set linear. */
-      if (image->vk.create_flags & VK_IMAGE_CREATE_2_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT_KHR)
+       * have VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT set linear.
+       *
+       * An emulated BC image has those views on its plane of blocks, which is
+       * linear anyway (select_plane_mod), and on a hidden plane that is
+       * block-compressed itself, which the transcoder stores whole blocks
+       * into. A hidden plane of plain texels can be tiled, as any other image
+       * of its format is (tried on v12 only). */
+      if ((image->vk.create_flags & VK_IMAGE_CREATE_2_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT_KHR) &&
+          (!bc_emu || arch < 10 ||
+           vk_format_is_compressed(panvk_bc_emu_carrier(phys_dev, image->vk.format))))
          return false;
    }
 
    /* Defer the rest of the checks to the mod handler. */
    struct pan_image_props iprops = {
-      .modifier = mod,
       .dim = panvk_image_type_to_mali_tex_dim(image->vk.image_type),
       .array_size = image->vk.array_layers,
       .nr_samples = image->vk.samples,
@@ -275,6 +306,7 @@ panvk_image_can_use_mod(struct panvk_image *image,
    };
 
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+      iprops.modifier = select_plane_mod(image, mod, plane);
       iprops.format = select_plane_pfmt(image, mod, plane);
       iprops.extent_px = (struct pan_image_extent){
          .width = vk_format_get_plane_width(image->vk.format, plane,
@@ -390,11 +422,11 @@ strict_import(struct panvk_image *image)
 }
 
 static struct pan_image_props
-get_pan_image_props(const struct vk_image *image, enum pipe_format pfmt,
-                    uint32_t plane, bool has_crc)
+get_pan_image_props(const struct vk_image *image, uint64_t mod,
+                    enum pipe_format pfmt, uint32_t plane, bool has_crc)
 {
    return (struct pan_image_props){
-      .modifier = image->drm_format_mod,
+      .modifier = mod,
       .format = pfmt,
       .dim = panvk_image_type_to_mali_tex_dim(image->image_type),
       .extent_px =
@@ -495,17 +527,20 @@ panvk_image_init_layouts(struct panvk_image *image,
    if (panvk_image_use_yuv_tex(arch, image->vk.format)) {
       const enum pipe_format pfmt = vk_format_to_pipe_format(image->vk.format);
       image->planes[0].image = (struct pan_image){
-         .props = get_pan_image_props(&image->vk, pfmt, 0, should_checksum),
+         .props = get_pan_image_props(&image->vk, image->vk.drm_format_mod,
+                                      pfmt, 0, should_checksum),
          .mod_handler = mod_handler,
       };
    } else {
       for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+         const uint64_t mod =
+            select_plane_mod(image, image->vk.drm_format_mod, plane);
          const enum pipe_format pfmt =
             select_plane_pfmt(image, image->vk.drm_format_mod, plane);
          image->planes[plane].image = (struct pan_image){
-            .props =
-               get_pan_image_props(&image->vk, pfmt, plane, should_checksum),
-            .mod_handler = mod_handler,
+            .props = get_pan_image_props(&image->vk, mod, pfmt, plane,
+                                         should_checksum),
+            .mod_handler = pan_mod_get_handler(arch, mod),
          };
       }
    }

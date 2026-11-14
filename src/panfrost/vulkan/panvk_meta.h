@@ -50,7 +50,9 @@ static inline struct vk_meta_copy_image_properties
 panvk_meta_copy_get_image_properties(struct panvk_image *img,
                                      bool use_gfx_pipeline, bool is_destination)
 {
-   uint64_t mod = img->vk.drm_format_mod;
+   /* The plane a copy reads or writes: an emulated BC image's plane of blocks is linear whatever
+    * the image's modifier (panvk_image.c's select_plane_mod). */
+   uint64_t mod = img->planes[0].image.props.modifier;
    enum pipe_format pfmt = vk_format_to_pipe_format(img->vk.format);
    struct vk_meta_copy_image_properties props;
    memset(&props, 0, sizeof(props));
