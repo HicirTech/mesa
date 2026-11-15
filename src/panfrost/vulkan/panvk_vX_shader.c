@@ -474,6 +474,13 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
                nir_var_shader_temp | nir_var_function_temp);
    }
 
+   /* Sparse residency reads, which only vkd3d-proton's feature level override
+    * emits on this driver (panvk_nir_lower_sparse.c). Before any texture
+    * lowering.
+    */
+   if (!pdev->vk.supported_features.shaderResourceResidency)
+      NIR_PASS(_, nir, panvk_nir_lower_sparse_residency);
+
    /* Ensure to regroup output variables at the same location */
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_opt_vectorize_io_vars, nir_var_shader_out);
