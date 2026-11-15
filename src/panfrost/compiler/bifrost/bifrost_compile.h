@@ -129,6 +129,7 @@ bool valhall_can_merge_workgroups(nir_shader *nir);
                                                                                \
       .has_ldexp = true,                                                       \
       .has_isub = true,                                                        \
+      .support_16bit_alu = true,                                               \
       .vectorize_vec2_16bit = true,                                            \
       .float_mul_add16 = nir_float_muladd_support_has_ffma |                   \
           nir_float_muladd_support_fuse,                                       \
