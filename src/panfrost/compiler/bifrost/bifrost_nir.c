@@ -199,13 +199,19 @@ bi_vectorize_filter(const nir_instr *instr, const void *data)
       return MAX2(1, 32 / bit_size);
 }
 
+struct mem_vectorize_data {
+   unsigned arch;
+   nir_variable_mode robust_modes;
+};
+
 static bool
 mem_vectorize_cb(unsigned align_mul, unsigned align_offset, unsigned bit_size,
                  unsigned num_components, int64_t hole_size,
                  nir_intrinsic_instr *low, nir_intrinsic_instr *high,
                  void *data)
 {
-   unsigned arch = *(unsigned *)data;
+   const struct mem_vectorize_data *vec_data = data;
+   unsigned arch = vec_data->arch;
 
    if (hole_size > 0)
       return false;
@@ -218,6 +224,19 @@ mem_vectorize_cb(unsigned align_mul, unsigned align_offset, unsigned bit_size,
    const unsigned max_bytes = 128u / 8u; /* LOAD.i128 */
 
    if (bytes > max_bytes)
+      return false;
+
+   /* A robust UBO load is bounds-checked against the size in the buffer
+    * descriptor, which PanVK rounds up to 16 bytes
+    * (robustUniformBufferAccessSizeAlignment). A merged load that stays in one
+    * 16-byte block is then wholly in or wholly out of bounds, whatever
+    * granularity the hardware checks at. One that crosses a block boundary
+    * could return zero for its in-bounds words if the check covers the whole
+    * access, which robustBufferAccess2 does not allow.
+    */
+   if (low->intrinsic == nir_intrinsic_load_ubo &&
+       (vec_data->robust_modes & nir_var_mem_ubo) &&
+       (align_mul < 16 || (align_offset % 16) + bytes > 16))
       return false;
 
    /* Valhall+ (v9+) supports unaligned load/store, so we don't need the
@@ -927,19 +946,38 @@ bifrost_postprocess_nir(nir_shader *nir,
     * test case: dEQP-VK.subgroups.ballot_broadcast.compute.subgroupbroadcast_u8vec3
     * TODO: Fix RA and re-enable temp vectorization.
     */
+   const struct mem_vectorize_data vectorize_data = {
+      .arch = gpu_arch,
+      .robust_modes = inputs->robust_modes,
+   };
    nir_load_store_vectorize_options vectorize_opts = {
       .modes = nir_var_mem_global |
                nir_var_mem_shared |
                nir_var_mem_ubo /* | nir_var_mem_temp */,
       .callback = mem_vectorize_cb,
-      .cb_data = (void *)&gpu_arch,
+      .cb_data = (void *)&vectorize_data,
       .robust_modes = inputs->robust_modes,
    };
 
-   /* Only allow vectorization of SSBOs when no robustness2 is configured */
+   /* SSBO loads are only vectorized when SSBO access is not robust at all
+    * (neither robustBufferAccess nor robustBufferAccess2).
+    */
    if (!(inputs->robust_modes & nir_var_mem_ssbo))
       vectorize_opts.modes |= nir_var_mem_ssbo;
 
+   /* The vectorizer only merges accesses whose buffer index and offset terms
+    * are the same SSA values (entry_key_equals), and nothing has optimized
+    * the address arithmetic since it was built: PanVK's valhall_pack_buf_idx
+    * packs the buffer index again for every access, and nir_lower_explicit_io
+    * builds every offset from a vec3 address of its own, which copy
+    * propagation above only flattened. Without constant folding, a constant
+    * offset stays iadd(0, k), which the vectorizer reads as a distinct term
+    * per access (compute shaders, where no pass folds them before this);
+    * without CSE, every access keeps its own index.
+    */
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_opt_load_store_vectorize, &vectorize_opts);
 
    /* Our OpenCL compiler (src/panfrost/clc/pan_compile.c) has a very weird and
