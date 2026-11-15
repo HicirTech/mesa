@@ -78,6 +78,18 @@ TEST_F(ValidateFau, Combined64BitUniformsConstants)
    INVALID(bi_fma_f32_to(b, bi_register(1), zero, imm1, imm2));
 }
 
+TEST_F(ValidateFau, ImmediatesOnAnyPage)
+{
+   bi_index unif_p1 = bi_fau((enum bir_fau)(BIR_FAU_UNIFORM | 40), false);
+   bi_index unif_p1_hi = bi_fau((enum bir_fau)(BIR_FAU_UNIFORM | 40), true);
+
+   VALID(bi_fma_f32_to(b, bi_register(1), bi_register(2), unif_p1, zero));
+   VALID(bi_fma_f32_to(b, bi_register(1), bi_register(2), zero, unif_p1));
+   VALID(bi_fma_f32_to(b, bi_register(1), imm1, bi_register(2), unif_p1));
+   INVALID(bi_fma_f32_to(b, bi_register(1), zero, unif_p1_hi, unif_p1));
+   INVALID(bi_fma_f32_to(b, bi_register(1), zero, unif_p1, unif));
+}
+
 TEST_F(ValidateFau, UniformsOnlyInDefaultMode)
 {
    INVALID(bi_fma_f32_to(b, bi_register(1), bi_register(2), unif_hi, lane_id));

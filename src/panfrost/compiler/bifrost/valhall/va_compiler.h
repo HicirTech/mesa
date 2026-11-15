@@ -59,8 +59,15 @@ va_fau_page(enum bir_fau value)
 static inline unsigned
 va_select_fau_page(const bi_instr *I)
 {
+   /* LUT immediates are encoded apart from the paged uniform and special
+    * values (0xC0-0xDF against 0x80-0xBF and 0xE0-0xFF) and read the same table
+    * on every page, so only uniforms and special values select the page. An
+    * immediate first in the source list used to select page 0, and a uniform
+    * from a later page was then moved into a register.
+    */
    bi_foreach_src(I, s) {
-      if (I->src[s].type == BI_INDEX_FAU)
+      if (I->src[s].type == BI_INDEX_FAU &&
+          !(I->src[s].value & BIR_FAU_IMMEDIATE))
          return va_fau_page((enum bir_fau)I->src[s].value);
    }
 
