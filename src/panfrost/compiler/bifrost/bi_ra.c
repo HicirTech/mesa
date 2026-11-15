@@ -1481,6 +1481,20 @@ bi_ra_lower(bi_context *ctx, unsigned first_reg)
    squeeze_index(ctx);
 }
 
+/* How far below the register file the SSA spiller takes a shader that does
+ * not fit it. The allocator that follows is not the one the spiller plans
+ * for: it runs out of SSA form, wants adjacent registers for a vector, cannot
+ * split a live range, and every node it has to spill itself costs a round of
+ * liveness and interference for the whole shader. Spilled to exactly the
+ * file, the big vertex shaders of Deep Rock Galactic on Direct3D 12 failed up
+ * to 227 rounds each, and the allocator's own spills are the dearer code.
+ * With room left they pass in a few rounds with a fifth less spill cost. The
+ * room that costs least grows with the demand (measured from 0 to 32).
+ */
+#define BI_SPILL_HEADROOM             8
+#define BI_SPILL_HEADROOM_HIGH_DEMAND 16
+#define BI_SPILL_HIGH_DEMAND          128
+
 void
 bi_register_allocate(bi_context *ctx)
 {
@@ -1518,7 +1532,14 @@ bi_register_allocate(bi_context *ctx)
          if (ctx->inputs->is_blend)
             UNREACHABLE("Blend shaders may not spill");
 
-         bi_spill_ssa(ctx, regs_to_use);
+         unsigned spill_to = regs_to_use;
+         if (regs_to_use == BI_MAX_REGS) {
+            spill_to -= register_demand > BI_SPILL_HIGH_DEMAND
+                           ? BI_SPILL_HEADROOM_HIGH_DEMAND
+                           : BI_SPILL_HEADROOM;
+         }
+
+         bi_spill_ssa(ctx, spill_to);
          spill_count += bi_lower_spill(ctx, spill_count);
 
          /* By default, we use packed TLS addressing on Valhall.
@@ -1534,7 +1555,7 @@ bi_register_allocate(bi_context *ctx)
          }
 
          /* The spiller stops as soon as the shader fits. */
-         register_demand = regs_to_use;
+         register_demand = spill_to;
       }
    }
 
