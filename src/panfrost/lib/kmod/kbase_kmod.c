@@ -197,6 +197,40 @@ union kbase_ioctl_mem_import {
 #define BASE_MEM_CSF_EVENT            (1ull << 19)
 #define BASE_MEM_UNCACHED_GPU         (1ull << 21)
 
+/* Memory group of an allocation, bits 25:22 of the flags. The vendor driver passes 0x180280f
+ * for its read/write buffers and asks for group 6 in CS_TILER_HEAP_INIT; MediaTek's memory
+ * group manager (mali_mgm_mt6989) gives that group the system level cache: DRAM reads answered
+ * within 128 cycles went from under 1% to about 17% of responses with it (measured in Wild
+ * Life), texture fetch stalls -10% and +2.9% fps in Deep Rock Galactic. A kernel whose memory
+ * group manager has fewer groups refuses it (the Pixel r44p1 tree declares 4): then group 0 is
+ * latched. KBASE_MEM_GROUP=<0-15> picks the group, for comparisons. */
+#define BASEP_MEM_GROUP_ID_SHIFT 22
+#define BASEP_MEM_GROUP_ID_MASK  (0xfull << BASEP_MEM_GROUP_ID_SHIFT)
+#define KBASE_MEM_GROUP_VENDOR   6
+
+static int kbase_mem_group_id = -1;
+
+static uint64_t
+kbase_mem_group(void)
+{
+   int group = p_atomic_read(&kbase_mem_group_id);
+   if (group < 0) {
+      const int64_t g = debug_get_num_option("KBASE_MEM_GROUP", KBASE_MEM_GROUP_VENDOR);
+      p_atomic_cmpxchg(&kbase_mem_group_id, -1,
+                       g >= 0 && g <= 15 ? (int)g : KBASE_MEM_GROUP_VENDOR);
+      group = p_atomic_read(&kbase_mem_group_id);
+   }
+   return group;
+}
+
+/* An allocation in our group failed and the same one in group 0 worked: keep group 0. */
+static void
+kbase_mem_group_refused(void)
+{
+   if (p_atomic_xchg(&kbase_mem_group_id, 0) > 0)
+      mesa_logw("kbase: the kernel refuses our memory group, using group 0");
+}
+
 /* ---- GPU property stream ------------------------------------------------------------------
  *
  * GET_GPUPROPS returns a packed run of (u32 header, value) pairs where header = (id << 2) | w,
@@ -995,6 +1029,7 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
          .extension = grow ? KBASE_GROW_STEP_PAGES : 0,
          .flags = exec ? KBASE_MEM_FLAGS_EXEC
                        : KBASE_MEM_FLAGS_RW | (grow ? BASE_MEM_GROW_ON_GPF : 0) |
+                            (kbase_mem_group() << BASEP_MEM_GROUP_ID_SHIFT) |
                             ((flags & PAN_KMOD_BO_FLAG_WB_MMAP) ? BASE_MEM_CACHED_CPU : 0),
       },
    };
@@ -1013,7 +1048,16 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
    if (kbase_dev->csf && !exec && !grow && (flags & PAN_KMOD_BO_FLAG_KBASE_SYNC))
       req.in.flags = 0xfull | BASE_MEM_SAME_VA | BASE_MEM_CSF_EVENT;
 
-   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req)) {
+   const union kbase_ioctl_mem_alloc first = req;
+   int ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req);
+   if (ret && (first.in.flags & BASEP_MEM_GROUP_ID_MASK)) {
+      req = first;
+      req.in.flags &= ~BASEP_MEM_GROUP_ID_MASK;
+      ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req);
+      if (!ret)
+         kbase_mem_group_refused();
+   }
+   if (ret) {
       mesa_loge("kbase: MEM_ALLOC of %" PRIu64 " pages, flags 0x%" PRIx64 ", failed (err=%d)",
                 pages, (uint64_t)req.in.flags, errno);
       pan_kmod_dev_free(dev, bo);
@@ -3633,9 +3677,19 @@ pan_kmod_kbase_csf_tiler_heap_create(struct pan_kmod_dev *dev, uint32_t chunk_si
          .initial_chunks = initial_chunks,
          .max_chunks = max_chunks,
          .target_in_flight = target_in_flight,
+         .group_id = kbase_mem_group(),
       },
    };
-   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req)) {
+   const union kbase_ioctl_cs_tiler_heap_init first = req;
+   int ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req);
+   if (ret && first.in.group_id) {
+      req = first;
+      req.in.group_id = 0;
+      ret = pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_TILER_HEAP_INIT, &req);
+      if (!ret)
+         kbase_mem_group_refused();
+   }
+   if (ret) {
       mesa_loge("kbase: CS_TILER_HEAP_INIT failed (err=%d)", errno);
       return false;
    }
