@@ -461,6 +461,14 @@ va_pack_alu(const bi_instr *I, unsigned arch)
    uint64_t hex = 0;
 
    switch (I->op) {
+   /* FROUND.f32 has no source widening on v11 and later: Arm's ISA description
+    * pins its widen field to none there.
+    */
+   case BI_OPCODE_FROUND_F32:
+      if (arch >= 11)
+         pack_assert(I, I->src[0].swizzle == BI_SWIZZLE_H01);
+      break;
+
    /* Add FREXP flags */
    case BI_OPCODE_FREXPE_F32:
    case BI_OPCODE_FREXPE_V2F16:

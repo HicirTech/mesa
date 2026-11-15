@@ -181,6 +181,96 @@ bi_fuse_small_int_to_f32(bi_context *ctx, bi_instr *I, bi_instr *mod)
    }
 }
 
+/*
+ * The Valhall opcode whose encoding an f32 instruction ends up with, for the
+ * source checks of va_fuse_f16_to_f32, or BI_NUM_OPCODES for instructions
+ * whose sources must not take a widened half.
+ */
+static enum bi_opcode
+va_widen_target(const bi_context *ctx, enum bi_opcode op)
+{
+   switch (op) {
+   case BI_OPCODE_FMA_F32:
+   case BI_OPCODE_FADD_F32:
+   case BI_OPCODE_FMIN_F32:
+   case BI_OPCODE_FMAX_F32:
+   case BI_OPCODE_FREXPE_F32:
+   case BI_OPCODE_FREXPM_F32:
+   case BI_OPCODE_FRCP_F32:
+   case BI_OPCODE_FRSQ_F32:
+   case BI_OPCODE_FLOGD_F32:
+      return op;
+   case BI_OPCODE_FCMP_F32:
+      /* va_lower_isel */
+      return BI_OPCODE_FCMP_OR_F32;
+   case BI_OPCODE_FABSNEG_F32:
+   case BI_OPCODE_FCLAMP_F32:
+      /* bi_lower_opt_instructions: FADD.f32 x, -0.0 */
+      return BI_OPCODE_FADD_F32;
+   case BI_OPCODE_FROUND_F32:
+      /* FROUND.f32 moved to the FMA unit on v11 and has no source widening
+       * there: Arm's ISA description pins its widen field to none on v11 and
+       * later (kraid/isa-v9-v14.xml), while valhall/ISA.xml describes the v9
+       * encoding.
+       */
+      return ctx->arch < 11 ? op : BI_NUM_OPCODES;
+   default:
+      return BI_NUM_OPCODES;
+   }
+}
+
+/*
+ * Whether source s of I can read a widened half, with abs/neg when absneg is
+ * set, in the encoding I ends up with.
+ */
+static bool
+va_takes_widened_half(const bi_context *ctx, const bi_instr *I, unsigned s,
+                      bool absneg)
+{
+   if (ctx->arch < 9 || I->src[s].swizzle != BI_SWIZZLE_H01)
+      return false;
+
+   enum bi_opcode target = va_widen_target(ctx, I->op);
+   if (target == BI_NUM_OPCODES || s >= valhall_opcodes[target].nr_srcs)
+      return false;
+
+   struct va_src_info info = va_src_info(target, s);
+   return info.swizzle && info.size == VA_SIZE_32 && (!absneg || info.absneg);
+}
+
+/*
+ * F16_TO_F32(x) -> x.h0/x.h1 read by a 32-bit float source that widens a half
+ * on the way in (Valhall .h0/.h1 source widening). The conversion is exact, so
+ * where it happens does not matter; once every use is folded the CVT
+ * instruction goes away.
+ */
+static bool
+va_fuse_f16_to_f32(bi_context *ctx, bi_instr *I, unsigned s, bi_instr *mod)
+{
+   if (mod->op != BI_OPCODE_F16_TO_F32)
+      return false;
+
+   /* A register or FAU half. Not a constant: immediate folding
+    * (va_fuse_add_imm) would pack its raw bits and ignore the widen.
+    */
+   bi_index repl = mod->src[0];
+   if (repl.type == BI_INDEX_CONSTANT ||
+       (repl.swizzle != BI_SWIZZLE_H0 && repl.swizzle != BI_SWIZZLE_H1))
+      return false;
+
+   /* The conversion's own modifiers move to the source, which must encode
+    * them: FREXPE.f32 and FREXPM.f32 sources take none on Valhall.
+    */
+   if (!va_takes_widened_half(ctx, I, s, repl.abs || repl.neg))
+      return false;
+
+   bi_index old = I->src[s];
+   repl.neg = old.neg ^ (repl.neg && !old.abs);
+   repl.abs |= old.abs;
+   I->src[s] = repl;
+   return true;
+}
+
 void
 bi_opt_mod_prop_forward(bi_context *ctx)
 {
@@ -214,7 +304,21 @@ bi_opt_mod_prop_forward(bi_context *ctx)
 
          bi_fuse_small_int_to_f32(ctx, I, mod);
 
+         if (va_fuse_f16_to_f32(ctx, I, s, mod))
+            continue;
+
          if (bi_is_fabsneg(mod->op, size)) {
+            /* A half widened by va_fuse_f16_to_f32 moves on only into a
+             * source that widens too (not FADD_LSCALE, FMA_RSCALE,
+             * CUBEFACE1, nor FROUND on v11+).
+             */
+            if (ctx->arch >= 9 && mod->op == BI_OPCODE_FABSNEG_F32 &&
+                mod->src[0].swizzle != BI_SWIZZLE_H01 &&
+                !va_takes_widened_half(ctx, I, s,
+                                       mod->src[0].abs || mod->src[0].neg ||
+                                          I->src[s].abs || I->src[s].neg))
+               continue;
+
             if (mod->src[0].abs && !bi_takes_fabs(ctx->arch, I, mod->src[0], s))
                continue;
 
@@ -269,6 +373,13 @@ bi_optimizer_clamp(unsigned arch, bi_instr *I, bi_instr *use)
    if (!bi_is_fclamp(use->op, bi_get_opcode_props(I)->size))
       return false;
    if (!bi_takes_clamp(I))
+      return false;
+
+   /* The clamp must read the whole result: a 32-bit clamp of a widened half
+    * (va_fuse_f16_to_f32) whose producer narrows to that half would otherwise
+    * drop the 16-bit rounding.
+    */
+   if (use->src[0].swizzle != BI_SWIZZLE_H01)
       return false;
 
    /* swizzle != H01 converts in valhall, check if it's available */

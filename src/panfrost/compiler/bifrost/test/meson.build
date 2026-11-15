@@ -8,6 +8,7 @@ test(
     files(
       'test-constant-fold.cpp',
       'test-dual-texture.cpp',
+      'test-f16-widening.cpp',
       'test-lower-swizzle.cpp',
       'test-message-preload.cpp',
       'test-optimizer.cpp',

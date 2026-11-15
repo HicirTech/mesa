@@ -626,3 +626,30 @@ TEST_F(Optimizer, Int16ToFloat32)
            bi_u16_to_f32_to(b, reg, bi_half(x, i)));
    }
 }
+
+/* Valhall widens a half on the way into the float sources that take a widen
+ * modifier, so F16_TO_F32 folds into its users. */
+TEST_F(Optimizer, F16ToF32FoldedIntoWideningSources)
+{
+   arch = 12;
+   for (unsigned i = 0; i < 2; ++i) {
+      CASE(bi_fadd_f32_to(b, reg, bi_f16_to_f32(b, bi_half(x, i)), y),
+           bi_fadd_f32_to(b, reg, bi_half(x, i), y));
+
+      CASE(bi_fma_f32_to(b, reg, y, bi_f16_to_f32(b, bi_half(x, i)), y),
+           bi_fma_f32_to(b, reg, y, bi_half(x, i), y));
+   }
+}
+
+/* FROUND.f32 lost its source widening at v11; v9 and v10 still have it. */
+TEST_F(Optimizer, F16ToF32FoldedIntoFroundBeforeV11Only)
+{
+   arch = 12;
+   NEGCASE(bi_fround_f32_to(b, reg, bi_f16_to_f32(b, bi_half(x, false)),
+                            BI_ROUND_RTN));
+
+   arch = 10;
+   CASE(bi_fround_f32_to(b, reg, bi_f16_to_f32(b, bi_half(x, true)),
+                         BI_ROUND_RTN),
+        bi_fround_f32_to(b, reg, bi_half(x, true), BI_ROUND_RTN));
+}
