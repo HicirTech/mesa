@@ -387,3 +387,25 @@ TEST_F(ValhallPacking, Rhadd8)
                         bi_discard(bi_register(0)), BI_ROUND_RTP),
         0x00aac000400b4041);
 }
+
+/* v12: 16-bit log2, and FPOW.f16 with the base fixed to 2.0 (immediate
+ * 0x40000000, high half), which is how Arm's ISA spells FEXP.f16. */
+TEST_F(ValhallPacking, Fp16LogExp)
+{
+   CASE_ARCH(bi_flog_f16_to(b, bi_register(1), bi_half(bi_register(2), false)),
+             12, 0x009cc10000090002ULL);
+   CASE_ARCH(bi_flog_f16_to(b, bi_register(1), bi_half(bi_register(2), true)),
+             12, 0x009cc10010090002ULL);
+
+   /* LUT entry 28 (0x40000000) is the low word of 64-bit slot 14. */
+   bi_index two = bi_fau((enum bir_fau)(BIR_FAU_IMMEDIATE | 14), false);
+   CASE_ARCH(bi_fpow_f16_to(b, bi_register(2), bi_half(two, true),
+                            bi_half(bi_register(1), false)),
+             12, 0x00a6c200130d01dcULL);
+   CASE_ARCH(bi_fpow_f16_to(b, bi_register(2), bi_half(two, true),
+                            bi_half(bi_register(1), true)),
+             12, 0x00a6c200170d01dcULL);
+   CASE_ARCH(bi_fpow_f16_to(b, bi_register(2), bi_half(two, true),
+                            bi_neg(bi_abs(bi_half(bi_register(1), false)))),
+             12, 0x00a6c230130d01dcULL);
+}

@@ -175,6 +175,8 @@ bi_instr_replicates(bi_instr *I, BITSET_WORD *replicates_16)
     */
    case BI_OPCODE_FRCP_F16:
    case BI_OPCODE_FRSQ_F16:
+   case BI_OPCODE_FLOG_F16:
+   case BI_OPCODE_FPOW_F16:
       return false;
 
    /* Not sure, be conservative, we don't use these.. */

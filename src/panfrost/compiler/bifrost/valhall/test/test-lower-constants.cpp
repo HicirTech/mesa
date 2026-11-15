@@ -238,3 +238,40 @@ TEST_F(LowerConstants, MaintainMkvecRestrictedSwizzles)
         bi_mkvec_v2i8_to(b, bi_register(0), bi_register(0),
                          bi_byte(va_lut(11), 2), va_lut(0)));
 }
+
+/* 16-bit lane sources take one half of a LUT entry whose halves are equal, or
+ * the half the swizzle selects. */
+TEST_F(LowerConstants, Lane16Constants)
+{
+   arch = 12;
+   /* FEXP.f16: the replicated 2.0 base is entry 28, high half. */
+   CASE(bi_fpow_f16_to(b, bi_register(0), bi_imm_u32(0x40004000),
+                       bi_half(bi_register(1), false)),
+        bi_fpow_f16_to(b, bi_register(0), bi_half(va_lut(28), true),
+                       bi_half(bi_register(1), false)));
+
+   /* MKVEC.v2i16 lanes take the half the swizzle selects. */
+   CASE(bi_mkvec_v2i16_to(b, bi_register(0), bi_half(bi_register(1), false),
+                          bi_half(bi_imm_u32(0x40003C00), true)),
+        bi_mkvec_v2i16_to(b, bi_register(0), bi_half(bi_register(1), false),
+                          bi_half(va_lut(28), true)));
+   CASE(bi_mkvec_v2i16_to(b, bi_register(0),
+                          bi_half(bi_imm_u32(0x40003C00), false),
+                          bi_half(bi_register(1), false)),
+        bi_mkvec_v2i16_to(b, bi_register(0), bi_half(va_lut(27), true),
+                          bi_half(bi_register(1), false)));
+
+   /* 255.0 is the low half of entry 23. */
+   CASE(bi_mkvec_v2i16_to(b, bi_register(0), bi_half(bi_register(1), false),
+                          bi_half(bi_imm_u32(0x00005BF8), false)),
+        bi_mkvec_v2i16_to(b, bi_register(0), bi_half(bi_register(1), false),
+                          bi_half(va_lut(23), false)));
+
+   /* Negated float halves use the source's neg: -1.0 and -0.5. */
+   CASE(bi_f16_to_f32_to(b, bi_register(0), bi_half(bi_imm_u32(0xBC00), false)),
+        bi_f16_to_f32_to(b, bi_register(0), bi_neg(bi_half(va_lut(27), true))));
+   CASE(bi_fpow_f16_to(b, bi_register(0), bi_imm_u32(0x40004000),
+                       bi_half(bi_imm_u32(0xB800), false)),
+        bi_fpow_f16_to(b, bi_register(0), bi_half(va_lut(28), true),
+                       bi_neg(bi_half(va_lut(26), true))));
+}

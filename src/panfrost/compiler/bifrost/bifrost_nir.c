@@ -45,8 +45,11 @@ bi_lower_bit_size(const nir_instr *instr, void *data)
       case nir_op_fexp2:
       case nir_op_flog2:
       case nir_op_fpow:
-         // Kraid can handle 16-bit fexp/flog/fpow on v12+
-         if (opts->use_kraid && opts->arch >= 12)
+         /* v12 to v14 have FLOG.f16 and FEXP.f16 (FPOW.f16 with a 2.0 base);
+          * 16-bit fpow becomes fexp2(flog2(a) * b) in
+          * bifrost_nir_lower_algebraic_late.
+          */
+         if (opts->arch >= 12 && opts->arch <= 14)
             return 0;
          FALLTHROUGH;
       case nir_op_fsin:

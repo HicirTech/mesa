@@ -2863,6 +2863,15 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
       break;
 
    case nir_op_fexp2:
+      if (sz == 16) {
+         /* v12 to v14: FPOW.f16 with the base 2.0 taken from immediate
+          * 0x40000000.h1, the encoding of FEXP.f16 (bi_lower_bit_size keeps
+          * these 16-bit there). */
+         assert(b->shader->arch >= 12 && b->shader->arch <= 14);
+         bi_fpow_f16_to(b, dst, bi_imm_u32(0x40004000), s0);
+         break;
+      }
+
       assert(sz == 32); /* should've been lowered */
 
       if (b->shader->quirks & BIFROST_NO_FP32_TRANSCENDENTALS)
@@ -2873,6 +2882,12 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
       break;
 
    case nir_op_flog2:
+      if (sz == 16) {
+         assert(b->shader->arch >= 12 && b->shader->arch <= 14);
+         bi_flog_f16_to(b, dst, s0);
+         break;
+      }
+
       assert(sz == 32); /* should've been lowered */
 
       if (b->shader->quirks & BIFROST_NO_FP32_TRANSCENDENTALS)

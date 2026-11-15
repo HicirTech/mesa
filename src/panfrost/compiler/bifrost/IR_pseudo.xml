@@ -190,4 +190,19 @@
     <src start="0"/>
   </ins>
 
+  <!-- Valhall v12 and later: single-instruction 16-bit log2 and power on the SFU. FEXP.f16 is
+       FPOW.f16 with the base fixed to 2.0 (immediate 0x40000000, high half). -->
+  <ins name="FLOG.f16" pseudo="true" unit="add">
+    <src start="0" mask="0xf7"/>
+    <mod name="neg0" start="3" size="1" opt="neg"/>
+    <mod name="abs0" start="4" size="1" opt="abs"/>
+  </ins>
+
+  <ins name="FPOW.f16" pseudo="true" unit="add">
+    <src start="0" mask="0xf7"/>
+    <src start="3" mask="0xf7"/>
+    <mod name="neg1" start="6" size="1" opt="neg"/>
+    <mod name="abs1" start="7" size="1" opt="abs"/>
+  </ins>
+
 </bifrost>

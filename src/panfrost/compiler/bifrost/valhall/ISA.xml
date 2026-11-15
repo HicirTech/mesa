@@ -1941,6 +1941,30 @@
     <src lane="28" size="16" absneg="true">Value to convert</src>
   </group>
 
+  <!-- v12 and later. With the base fixed to immediate 0x40000000.h1 (2.0), which is how the
+       compiler uses it, this is the 16-bit base-2 exponent (FEXP.f16). -->
+  <ins name="FPOW.f16" title="16-bit power" dests="1" unused="true" unit="SFU">
+    <opcode>
+      <op val="0xA6" start="48" mask="0x1FF"/>
+      <op val="0xD" start="16" mask="0xF"/> <!-- opcode2 -->
+      <op val="0x3" start="24" mask="0x3"/> <!-- opcode3 -->
+    </opcode>
+    <desc>Computes $A^B$ on 16-bit floats.</desc>
+    <src lane="28" size="16">Base</src>
+    <src lane="26" size="16" absneg="true">Exponent</src>
+  </ins>
+
+  <!-- v12 and later. The source is a lane, one bit at 28 with bit 29 reserved
+       (kraid/isa-v9-v14.xml), not the 2-bit swizzle of the SFU group. -->
+  <ins name="FLOG.f16" title="16-bit base-2 logarithm" dests="1" unused="true" unit="SFU">
+    <opcode>
+      <op val="0x9C" start="48" mask="0x1FF"/>
+      <op val="0x9" start="16" mask="0x1F"/> <!-- opcode2 -->
+    </opcode>
+    <desc>Computes the base-2 logarithm of a 16-bit float.</desc>
+    <src lane="28" size="16" absneg="true">Value</src>
+  </ins>
+
   <ins name="F16_TO_F32" title="16-bit float to 32-bit float conversion" dests="1" unused="true" unit="CVT">
     <opcode>
       <op val="0x90" start="48" mask="0x1FF"/>

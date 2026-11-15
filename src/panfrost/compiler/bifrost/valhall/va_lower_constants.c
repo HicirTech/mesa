@@ -133,9 +133,12 @@ va_lookup_constant(uint32_t value, struct va_src_info info, bool is_signed)
       }
    }
 
-   /* Try using a single half of a FP16 constant */
+   /* Try using a single half of a FP16 constant. A 16-bit lane source reads
+    * one half too (FPOW.f16 takes its 2.0 base from 0x40000000.h1).
+    */
    bool replicated_halves = (value & 0xFFFF) == (value >> 16);
-   if (info.swizzle && info.size == VA_SIZE_16 && replicated_halves) {
+   if ((info.swizzle || info.lane) && info.size == VA_SIZE_16 &&
+       replicated_halves) {
       bi_index lut = va_lut_index_16(value & 0xFFFF);
       if (!bi_is_null(lut))
          return lut;
