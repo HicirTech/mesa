@@ -3180,6 +3180,30 @@ for f2f16 in ['f2f16', 'f2f16_rtz', 'f2f16_rtne']:
       ((f2f16, ('f2f32', 'a@16')), ('fcanonicalize', a)),
       ((f2f16, ('bcsel', a, '#b', c)), ('bcsel', a, (f2f16, b), (f2f16, c)), 'options->support_16bit_alu'),
       ((f2f16, ('bcsel', a, b, '#c')), ('bcsel', a, (f2f16, b), (f2f16, c)), 'options->support_16bit_alu'),
+
+      # Narrowing a select narrows whichever value it picks, so a select between widened 16-bit
+      # values can stay in 16 bits. This walks a chain of selects (a switch turned into bcsel)
+      # one level per match.
+      ((f2f16, ('bcsel(is_used_once)', a, b, ('f2f32', 'c@16'))), ('bcsel', a, (f2f16, b), ('fcanonicalize', c)), 'options->support_16bit_alu'),
+      ((f2f16, ('bcsel(is_used_once)', a, ('f2f32', 'b@16'), c)), ('bcsel', a, ('fcanonicalize', b), (f2f16, c)), 'options->support_16bit_alu'),
+   ]
+
+# A 32-bit fadd/fmul of two widened 16-bit values rounded back to 16 bits gives the 16-bit
+# operation's result: rounding the binary32 result of binary16 operands to binary16 again equals
+# rounding the exact result once (24 >= 2 * 11 + 2 significand bits), as long as neither step
+# rounds towards zero. Same as the f2fmp rules above, for the explicit conversion.
+narrow_cond = ('options->support_16bit_alu && ' +
+               '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 16) && ' +
+               '!nir_is_rounding_mode_rtz(info->float_controls_execution_mode, 32)')
+for f2f16 in ['f2f16', 'f2f16_rtne']:
+   for op in ['fadd', 'fmul']:
+      optimizations += [
+         ((f2f16, (f'{op}(is_used_once,contract)', ('f2f32', 'a@16'), ('f2f32', 'b@16'))), (op, a, b), narrow_cond),
+         ((f2f16, (f'{op}(is_used_once,contract)', ('f2f32', 'a@16'), '#b(is_representable_as_f16)')), (op, a, (f2f16, b)), narrow_cond),
+      ]
+   optimizations += [
+      ((f2f16, ('fadd(is_used_once,contract)', ('f2f32', 'a@16'), ('fneg', ('f2f32', 'b@16')))), ('fadd', a, ('fneg', b)), narrow_cond),
+      ((f2f16, ('fadd(is_used_once,contract)', ('fneg', ('f2f32', 'a@16')), ('fneg', ('f2f32', 'b@16')))), ('fneg', ('fadd', a, b)), narrow_cond),
    ]
 
 optimizations += [
