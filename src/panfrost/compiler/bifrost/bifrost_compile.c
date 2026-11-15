@@ -2556,6 +2556,17 @@ bi_nir_is_replicated(nir_alu_src *src)
    return true;
 }
 
+/* Whether a 16-bit source brings its value to lane 0 without a swizzle, for
+ * an instruction that has no source swizzles and only writes lane 0.
+ * Constants get their swizzle folded later.
+ */
+static bool
+bi_reads_lane0(bi_index src)
+{
+   return src.type == BI_INDEX_CONSTANT || src.swizzle == BI_SWIZZLE_H00 ||
+          src.swizzle == BI_SWIZZLE_H01;
+}
+
 static void
 bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
 {
@@ -2905,6 +2916,22 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
 
    case nir_op_bcsel_pan:
       assert(sz <= 32);
+
+      /* A scalar 16-bit select reads its sources with .h00, which MUX.v2i16
+       * can encode and CSEL.v2u16 cannot, so va_lower_isel would leave it a
+       * MUX on the quarter-rate SFU. Its destination is scalar, so
+       * bi_lower_swizzle drops .h00 (lane 0 is all that is written) and
+       * folds constant swizzles: a CSEL on the CVT unit. A source in the
+       * high half (.h11) would need a swizzle instruction, so that case
+       * stays a MUX.
+       */
+      if (b->shader->arch >= 9 && sz == 16 && comps == 1 &&
+          bi_reads_lane0(s0) && bi_reads_lane0(s1) && bi_reads_lane0(s2)) {
+         bi_csel_to(b, nir_type_uint, sz, dst, s0, bi_zero(), s2, s1,
+                    BI_CMPF_EQ);
+         break;
+      }
+
       bi_mux_to(b, sz, dst, s2, s1, s0, BI_MUX_INT_ZERO);
       break;
 
