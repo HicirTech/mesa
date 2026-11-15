@@ -68,6 +68,10 @@ void bifrost_postprocess_nir(nir_shader *nir,
                              const struct pan_compile_inputs *inputs,
                              struct pan_shader_info *info);
 
+/* v12+ vertex shaders: one copy of the shader behind each shader_output bit,
+ * each specialised for its own outputs. */
+void bifrost_handle_unified_idvs_shader(nir_shader *nir);
+
 void bifrost_compile_shader_nir(nir_shader *nir,
                                 const struct pan_compile_inputs *inputs,
                                 struct util_dynarray *binary,

@@ -15,6 +15,7 @@ test(
       'test-packing.cpp',
       'test-ra-coalesce.cpp',
       'test-scheduler-predicates.cpp',
+      'test-unified-idvs.cpp',
       'test-vectorize-loads.cpp',
     ),
     cpp_args : [cpp_msvc_compat_args],

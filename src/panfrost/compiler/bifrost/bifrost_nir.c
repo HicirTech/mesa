@@ -1338,7 +1338,7 @@ bifrost_make_unified_idvs_shader(nir_shader *nir)
    b->cursor = nir_before_impl(impl);
    nir_def *shader_output = nir_load_shader_output_pan(b);
 
-   nir_block *out_blocks[VA_SHADER_OUTPUT_COUNT] = {NULL};
+   nir_if *out_ifs[VA_SHADER_OUTPUT_COUNT] = {NULL};
 
    for (enum va_shader_output out = 0; out < VA_SHADER_OUTPUT_COUNT; ++out) {
       nir_def *cond =
@@ -1348,21 +1348,24 @@ bifrost_make_unified_idvs_shader(nir_shader *nir)
                                      NULL);
       nir_pop_if(b, NULL);
 
-      out_blocks[out] = nir_if_first_then_block(nif);
+      out_ifs[out] = nif;
    }
 
    /* After messing around with the CFG, reindex blocks. */
    nir_index_blocks(impl);
 
    /* This is more or less what nir_inline_sysval does, except that it uses a
-    * different constant depending on which of the out_blocks the intrinsic
-    * instruction is in.
+    * different constant depending on which copy the intrinsic instruction is
+    * in. Every block of a copy is visited: pan_nir_lower_vs_outputs stores the
+    * outputs after the shader's own code, so in a shader with an if or a loop
+    * they are not in the copy's first block, and a copy left with the run-time
+    * test keeps every output instead of its own.
     */
    for (enum va_shader_output out = 0; out < VA_SHADER_OUTPUT_COUNT; ++out) {
-      nir_block *out_block = out_blocks[out];
-      assert(out_block);
+      nir_if *out_if = out_ifs[out];
+      assert(out_if);
 
-      nir_foreach_block_in_cf_node_safe(block, &out_block->cf_node) {
+      nir_foreach_block_in_cf_node_safe(block, &out_if->cf_node) {
          nir_foreach_instr_safe(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
@@ -1383,7 +1386,7 @@ bifrost_make_unified_idvs_shader(nir_shader *nir)
    return true;
 }
 
-static void
+void
 bifrost_handle_unified_idvs_shader(nir_shader *nir)
 {
    NIR_PASS(_, nir, bifrost_make_unified_idvs_shader);
@@ -1398,8 +1401,12 @@ bifrost_handle_unified_idvs_shader(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_cse);
    }
 
-   /* Hoist common values before the predicated blocks. */
-   NIR_PASS(_, nir, nir_opt_gcm, true);
+   /* Values common to the copies are not hoisted above them (nir_opt_gcm
+    * with value numbering): the position and the varying part run as
+    * separate invocations, so a hoisted value saves no work, and it stays in
+    * a register through the position copy, which made vertex shaders
+    * spill.
+    */
 }
 
 static const char *
