@@ -282,6 +282,14 @@ bi_optimize_loop(nir_shader *nir, unsigned arch, bool allow_copies)
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_cse);
 
+      /* A 32-bit variable that only ever holds 16-bit results (a float
+       * accumulator of half math, a switch picking among half values) turns
+       * into a 32-bit phi with a conversion on every edge and use. Move the
+       * conversions so the phi is 16-bit; run before peephole_select turns
+       * the small ones into bcsel.
+       */
+      NIR_PASS(progress, nir, nir_opt_phi_precision);
+
       nir_opt_peephole_select_options peephole_select_options = {
          .limit = 64,
          .expensive_alu_ok = true,
