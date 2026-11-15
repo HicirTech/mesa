@@ -2237,15 +2237,15 @@ panvk_vs_xfb_passthrough(const nir_shader *nir)
 }
 
 #if PAN_ARCH >= 10
-/* With PANVK_DEBUG=push_ubo, constant reads from a shader's dynamic uniform buffers move to the
- * FAU: their addresses are known when a draw is recorded, so a compute job ahead of the draw
- * copies the pushed words in (copy_pushed_ubos, csf/panvk_vX_cmd_draw.c). Only the hardware
- * vertex shader and the fragment shader of an IDVS draw get there. Off by default: every draw
- * then prepares its own FAU block, which a draw-bound frame pays for on the CPU. */
+/* Constant reads from a shader's dynamic uniform buffers move to the FAU: their addresses are
+ * known when a draw is recorded, so a compute job ahead of the draw copies the pushed words in
+ * (copy_pushed_ubos, csf/panvk_vX_cmd_draw.c). Only the hardware vertex shader and the fragment
+ * shader of an IDVS draw get there. Every draw of a pushing shader prepares its own FAU block,
+ * CPU time that so far only draw benchmarks show; PANVK_DEBUG=no_push_ubo turns pushing off. */
 static uint32_t
 pushable_dyn_ubos(const struct panvk_shader_desc_info *desc_info)
 {
-   if (!PANVK_DEBUG(PUSH_UBO) || desc_info->dyn_bufs_start >= 32)
+   if (PANVK_DEBUG(NO_PUSH_UBO) || desc_info->dyn_bufs_start >= 32)
       return 0;
 
    const uint32_t count = MIN2(desc_info->dyn_bufs.count, 32 - desc_info->dyn_bufs_start);

@@ -57,7 +57,7 @@ static const struct debug_control panvk_debug_options[] = {
    {"hsr_prepass", PANVK_DEBUG_HSR_PREPASS},
    {"no_crc", PANVK_DEBUG_NO_CRC},
    {"dvs", PANVK_DEBUG_DVS},
-   {"push_ubo", PANVK_DEBUG_PUSH_UBO},
+   {"no_push_ubo", PANVK_DEBUG_NO_PUSH_UBO},
    {NULL, 0},
 };
 
