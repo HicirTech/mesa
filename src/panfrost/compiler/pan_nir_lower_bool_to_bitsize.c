@@ -53,14 +53,16 @@ make_sources_canonical(nir_builder *b, nir_alu_instr *alu, uint32_t start_idx)
 {
    const nir_op_info *op_info = &nir_op_infos[alu->op];
 
-   /* TODO: for now we take the bit-size of the first non-const source as the
-    * canonical form but we could try to be smarter.
+   /* Take the smallest bit-size of the non-const sources: narrowing a boolean
+    * is free (i2i16 of a 32-bit boolean is a move the backend folds into a
+    * half-register read), widening one costs an S16_TO_S32.
     */
    uint32_t bit_size = 0;
    for (uint32_t i = start_idx; i < op_info->num_inputs; i++) {
       if (!nir_src_is_const(alu->src[i].src)) {
-         bit_size = nir_src_bit_size(alu->src[i].src);
-         break;
+         uint32_t src_bit_size = nir_src_bit_size(alu->src[i].src);
+         if (bit_size == 0 || src_bit_size < bit_size)
+            bit_size = src_bit_size;
       }
    }
    if (bit_size == 0)
