@@ -175,6 +175,11 @@ pan_preprocess_nir(nir_shader *nir, unsigned arch)
       .lower_tg4_broadcom_swizzle = true,
       .lower_txd = arch < 6,
       .lower_txd_cube_map = true,
+      /* SampleGrad with a clamp: the gradient descriptor has no minimum
+       * LOD, and pan_nir_lower_tex would take the bias/clamp path and drop
+       * the gradients.
+       */
+      .lower_txd_clamp = true,
       .lower_invalid_implicit_lod = true,
    };
 
