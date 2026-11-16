@@ -181,12 +181,15 @@ struct pan_kmod_kbase_cs_call {
 
 /* Writes the calls into the rings in order, then a completion signal on every queue that has a
  * call or is in signal_queue_mask, and kicks them. done runs on the kmod's event thread once all
- * of those queues are past it (ok = false if the group faulted). Returns the submission's
- * sequence number, 0 if nothing was submitted (done has not run then). */
+ * of those queues are past it (ok = false if the group faulted). prior_waits (or NULL) holds
+ * one queue mask per queue: queue q first waits, on the GPU, until every queue in
+ * prior_waits[q] is past all earlier submissions. Returns the submission's sequence number, 0
+ * if nothing was submitted (done has not run then). */
 uint64_t pan_kmod_kbase_csf_submit(struct pan_kmod_kbase_csf_group *group,
                                    const struct pan_kmod_kbase_cs_call *calls, unsigned nr_calls,
                                    uint32_t signal_queue_mask, uint64_t wait_seq,
-                                   pan_kmod_kbase_done_cb done, void *data);
+                                   const uint32_t *prior_waits, pan_kmod_kbase_done_cb done,
+                                   void *data);
 
 /* Waits for the submission seq (0: the latest) to complete. False on timeout. */
 bool pan_kmod_kbase_csf_wait(struct pan_kmod_kbase_csf_group *group, uint64_t seq,

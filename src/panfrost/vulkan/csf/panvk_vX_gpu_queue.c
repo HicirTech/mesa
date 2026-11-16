@@ -586,7 +586,7 @@ init_subqueue(struct panvk_gpu_queue *queue, enum panvk_subqueue_id subqueue)
       };
       cs_builder_fini(&b);
       const uint64_t seq =
-         pan_kmod_kbase_csf_submit(queue->kbase_group, &call, 1, 0, 0, NULL, NULL);
+         pan_kmod_kbase_csf_submit(queue->kbase_group, &call, 1, 0, 0, NULL, NULL, NULL);
       if (!seq || !pan_kmod_kbase_csf_wait(queue->kbase_group, seq, INT64_MAX) ||
           pan_kmod_kbase_csf_group_faulted(queue->kbase_group))
          return panvk_errorf(dev->vk.physical, VK_ERROR_INITIALIZATION_FAILED,
@@ -1647,9 +1647,18 @@ panvk_queue_submit_kbase(struct panvk_gpu_queue *queue, struct vk_queue_submit *
    pan_kmod_kbase_sync_submitted(d->signals, d->nr_signals);
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
+   /* The vertex/tiler subqueue starts only once the compute subqueue is past every earlier
+    * submission. Without it STEINS;GATE RE:BOOT (DXVK 2.4.1-gplasync) loses the device at its
+    * title: kbase reports DATA_INVALID_FAULT on the vertex/tiler queue, which needs a
+    * submission's vertex work to overlap the previous submission's compute work. Waiting for
+    * the fragment subqueue instead does not help, nor does ordering the other way round. Which
+    * access the command streams' own barriers miss is not known yet. */
+   uint32_t prior_waits[PAN_KMOD_KBASE_CSF_MAX_QUEUES] = {0};
+   prior_waits[PANVK_SUBQUEUE_VERTEX_TILER] = BITFIELD_BIT(PANVK_SUBQUEUE_COMPUTE);
+
    const uint64_t seq =
       pan_kmod_kbase_csf_submit(queue->kbase_group, calls, nr_calls,
-                                BITFIELD_MASK(PANVK_SUBQUEUE_COUNT), wait_seq,
+                                BITFIELD_MASK(PANVK_SUBQUEUE_COUNT), wait_seq, prior_waits,
                                 panvk_kbase_csf_done, d);
    free(calls);
    if (refresh)

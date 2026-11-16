@@ -3731,11 +3731,22 @@ kbase_csf_emit(struct kbase_csf_ring *r, uint64_t ins)
    r->insert += 8;
 }
 
+/* Ring instructions that wait until queue w of the group has signaled target times, through
+ * registers A (address) and V (value). */
+static void
+kbase_csf_emit_seq_wait(struct kbase_csf_ring *r, const struct pan_kmod_kbase_csf_group *g,
+                        unsigned w, uint64_t target, uint64_t A, uint64_t V)
+{
+   kbase_csf_emit(r, cs_ins(CS_OP_MOVE48, (A << 48) | (g->seq_va + w * 64)));
+   kbase_csf_emit(r, cs_ins(CS_OP_MOVE48, (V << 48) | (target - 1)));
+   kbase_csf_emit(r, cs_ins(CS_OP_SYNC_WAIT64, (A << 40) | (V << 32) | (1u << 28)));
+}
+
 uint64_t
 pan_kmod_kbase_csf_submit(struct pan_kmod_kbase_csf_group *g,
                           const struct pan_kmod_kbase_cs_call *calls, unsigned nr_calls,
                           uint32_t signal_queue_mask, uint64_t wait_seq,
-                          pan_kmod_kbase_done_cb done, void *data)
+                          const uint32_t *prior_waits, pan_kmod_kbase_done_cb done, void *data)
 {
    struct kbase_kmod_dev *kdev = g->kdev;
    struct kbase_csf_dev *c = kdev->csfq;
@@ -3772,10 +3783,23 @@ pan_kmod_kbase_csf_submit(struct pan_kmod_kbase_csf_group *g,
          struct kbase_csf_ring *r = &g->ring[q];
          if (!kbase_csf_ring_reserve(g, r, 3 * 8 * PAN_KMOD_KBASE_CSF_MAX_QUEUES))
             return 0;
-         u_foreach_bit(w, wait_mask) {
-            kbase_csf_emit(r, cs_ins(CS_OP_MOVE48, (A << 48) | (g->seq_va + w * 64)));
-            kbase_csf_emit(r, cs_ins(CS_OP_MOVE48, (V << 48) | (wait_target[w] - 1)));
-            kbase_csf_emit(r, cs_ins(CS_OP_SYNC_WAIT64, (A << 40) | (V << 32) | (1u << 28)));
+         u_foreach_bit(w, wait_mask)
+            kbase_csf_emit_seq_wait(r, g, w, wait_target[w], A, V);
+      }
+   }
+
+   /* The caller's waits on earlier work of other queues of this group, also on the GPU. */
+   if (prior_waits) {
+      u_foreach_bit(q, mask) {
+         const uint32_t ws = prior_waits[q] & BITFIELD_MASK(g->nr_queues);
+         if (!ws)
+            continue;
+         struct kbase_csf_ring *r = &g->ring[q];
+         if (!kbase_csf_ring_reserve(g, r, 3 * 8 * PAN_KMOD_KBASE_CSF_MAX_QUEUES))
+            return 0;
+         u_foreach_bit(w, ws) {
+            if (g->ring[w].signals)
+               kbase_csf_emit_seq_wait(r, g, w, g->ring[w].signals, A, V);
          }
       }
    }
